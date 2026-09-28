@@ -136,12 +136,17 @@ export const DEFAULT_JEV_QUESTIONS: Record<string, JevQuestion> = {
       "Any change to what a customer is charged or shown as a price is at least Moderate.",
     criteria: RISK_LEVELS,
   },
+  // Mechanical, not a judgment call: "can this be gated and isn't yet", never
+  // "is gating worthwhile" — that takes business context Jev doesn't have. The
+  // pipeline's policy is to flag nearly everything that can be flagged.
   flag_worthy: {
     type: "noul",
-    instructions: "Should this change be released behind a feature flag?",
+    instructions:
+      "Can the behavior this change introduces or modifies be gated at runtime with a LaunchDarkly feature flag, where it is not already gated? " +
+      "Do not judge whether gating is worthwhile — only whether it is technically possible and not yet done.",
     criteria: {
-      true: "It changes user-facing behavior, business logic, an API, or an endpoint, so it should be gated and released progressively",
-      false: "It has no user-facing behavior change (docs, tests, dependencies, config, infrastructure, pure refactor)",
+      true: "Yes: the change alters code that runs in production (UI, API endpoints, business logic, runtime configuration reads) and no existing flag evaluation already wraps that changed code",
+      false: "No: nothing gateable changed (only docs, comments, tests, CI/build files, or dependency manifests), or every changed runtime path is already wrapped by an existing flag evaluation",
     },
   },
   pr_type: {
@@ -171,13 +176,14 @@ export const DEFAULT_JEV_QUESTIONS: Record<string, JevQuestion> = {
   flag_action: {
     type: "choice",
     instructions:
-      "Which flag action fits this change? Look for existing flag evaluations around the changed code in the diff.",
+      "Which flag action fits this change? Decide mechanically from the diff: look for existing flag evaluations around the changed code. " +
+      "Do not judge whether a flag is worthwhile.",
     criteria: {
-      create: "Flag-worthy, and no existing flag gates the touched code: create a fresh flag",
-      ride_existing: "An existing flag gates this code and the change iterates on the flagged, not-yet-released variation",
-      extend_variation: "An existing multivariate flag gates this code, its variation is already released, and this is an iteration: add the next variation",
-      child_flag: "Net-new functionality inside or next to already-flagged code: create a new flag with the existing one as a prerequisite",
-      none: "Not flag-worthy at all",
+      create: "The change alters runtime behavior and no existing flag evaluation wraps the changed code: create a fresh flag",
+      ride_existing: "An existing flag evaluation wraps the changed code and the change iterates on that flagged path",
+      extend_variation: "An existing multivariate flag wraps the changed code and the change adds a new alternative to it: add the next variation",
+      child_flag: "The change adds new functionality inside or next to code already wrapped by a flag: create a new flag with the existing one as a prerequisite",
+      none: "Nothing in the change runs at runtime (only docs, comments, tests, CI/build files, or dependency manifests)",
     },
   },
   feature_novelty: {

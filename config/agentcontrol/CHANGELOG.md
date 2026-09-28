@@ -17,6 +17,22 @@ Status legend: ✅ done · 🔜 planned/in progress
 
 ## 2026-09-28 (Jev pre-classification, optional layer)
 
+### ✅ `autofactory-jev-preclassifier/default`: flag questions are mechanical, not judgment calls
+- `flag_worthy` now asks whether the changed runtime behavior *can* be gated by a
+  LaunchDarkly flag and isn't already, not whether it *should* be. `flag_action`'s
+  `none` option now means "nothing in the change runs at runtime", replacing "not
+  flag-worthy at all". Why: the pipeline's policy is to flag nearly everything that
+  can be flagged, and "worthwhile" takes business context Jev doesn't have.
+- Trigger: on app PR #28 (gift guide) the old wording gave `flag_action=none@0.85`,
+  which cleared the prefill bar and was injected into the planner's prompt.
+- Side-by-side on five real app-repo changes:
+  - gift guide: flag_action none@0.61 → create@0.95
+  - loyalty points: none@0.82 → create@0.98, flag_worthy 0.66 → 0.96
+  - docs-only and CI-only changes: still not flaggable, at ≥0.94
+  - the already-flagged sort-by merge commit: now reads "already gated"
+- Edited live (PATCH + modelConfigKey re-assert), plus the code fallback and this
+  seed.
+
 ### ✅ New AI config `autofactory-jev-preclassifier` + custom model config `TypeSafe.jev-latest`
 - Completion-mode config holding the Jev question set, so wording can be edited and
   A/B-tested in LaunchDarkly instead of in code. The `default` variation points at the
