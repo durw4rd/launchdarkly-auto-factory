@@ -1,11 +1,15 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
+import type { LDAIClient, LDAIConfigTracker } from "@launchdarkly/server-sdk-ai";
 
 import {
+  DEFAULT_JEV_QUESTIONS,
+  JEV_AI_CONFIG_KEY,
+  JEV_PREFILL_MIN_CONFIDENCE,
   type JevAnswer,
   type JevPreclassification,
   askJev,
@@ -16,6 +20,7 @@ import {
   formatJevHints,
   interpretJevAnswers,
   jevConfidence,
+  resolveJevConfig,
   riskScoreFromLevel,
   runJevPreclassification,
   validateJevQuestions,
@@ -188,5 +193,85 @@ describe("jev pre-classification", () => {
     const down = (async () => jsonResponse(500, {})) as typeof fetch;
     assert.equal(await runJevPreclassification({ apiKey: "k", root: dir, baseRef: "main", fetchImpl: down }), undefined);
     assert.equal(await runJevPreclassification({ apiKey: "", root: dir }), undefined);
+  });
+});
+
+/** Stub tracker recording which methods were called. */
+function recordingTracker(): { tracker: LDAIConfigTracker; calls: string[] } {
+  const calls: string[] = [];
+  const tracker = {
+    getTrackData: () => ({ variationKey: "v2", configKey: JEV_AI_CONFIG_KEY, version: 3 }),
+    trackDuration: () => calls.push("duration"),
+    trackTokens: () => calls.push("tokens"),
+    trackSuccess: () => calls.push("success"),
+    trackError: () => calls.push("error"),
+  } as unknown as LDAIConfigTracker;
+  return { tracker, calls };
+}
+
+function stubAiClient(config: Record<string, unknown>, tracker?: LDAIConfigTracker): LDAIClient {
+  return {
+    completionConfig: async () => ({ ...config, createTracker: () => tracker }),
+  } as unknown as LDAIClient;
+}
+
+describe("jev AI Config", () => {
+  it("the committed config seeds exactly the built-in question set", () => {
+    const cfg = JSON.parse(readFileSync("config/agentcontrol/ai-configs/autofactory-jev-preclassifier.json", "utf8"));
+    assert.equal(cfg.key, JEV_AI_CONFIG_KEY);
+    assert.equal(cfg.mode, "completion");
+    const v = cfg.variations[0];
+    assert.equal(v.modelConfigKey, "TypeSafe.jev-latest");
+    assert.deepEqual(v.model.custom.questions, DEFAULT_JEV_QUESTIONS);
+    assert.equal(v.model.parameters.minPrefillConfidence, JEV_PREFILL_MIN_CONFIDENCE);
+    const mc = JSON.parse(readFileSync("config/agentcontrol/model-configs/typesafe-jev-latest.json", "utf8"));
+    assert.equal(mc.key, v.modelConfigKey);
+  });
+
+  it("uses the variation's questions, model, and prefill bar", async () => {
+    const { tracker } = recordingTracker();
+    const questions = { risk: DEFAULT_JEV_QUESTIONS.risk };
+    const cfg = await resolveJevConfig(
+      stubAiClient(
+        { enabled: true, model: { name: "jev-1.13.0", parameters: { minPrefillConfidence: 0.8 }, custom: { questions } } },
+        tracker,
+      ),
+      { kind: "user", key: "k" },
+    );
+    assert.equal(cfg.source, "ai-config");
+    assert.equal(cfg.model, "jev-1.13.0");
+    assert.equal(cfg.minPrefillConfidence, 0.8);
+    assert.equal(cfg.variation, "v2");
+    assert.deepEqual(cfg.questions, questions);
+  });
+
+  it("falls back to the built-in questions when the config is disabled or malformed", async () => {
+    const off = await resolveJevConfig(stubAiClient({ enabled: false }), { kind: "user", key: "k" });
+    assert.equal(off.source, "code");
+    assert.equal(off.questions, DEFAULT_JEV_QUESTIONS);
+    const bad = await resolveJevConfig(
+      stubAiClient({ enabled: true, model: { name: "jev-latest", custom: { questions: { risk: { type: "score", criteria: "x" } } } } }),
+      { kind: "user", key: "k" },
+    );
+    assert.equal(bad.source, "code");
+  });
+
+  it("maps a non-default rubric size linearly", () => {
+    assert.equal(riskScoreFromLevel(0, 3), 0.1);
+    assert.ok(Math.abs(riskScoreFromLevel(1, 3) - 0.5) < 1e-9);
+    assert.ok(Math.abs(riskScoreFromLevel(2, 3) - 0.9) < 1e-9);
+  });
+
+  it("records duration, tokens, and success on the tracker — or error", async () => {
+    const dir = fixtureRepo();
+    const ok = (async () => jsonResponse(200, { model: "jev-1", answers, usage: { input_tokens: 10, output_tokens: 2 } })) as typeof fetch;
+    const good = recordingTracker();
+    await runJevPreclassification({ apiKey: "k", root: dir, baseRef: "main", tracker: good.tracker, fetchImpl: ok });
+    assert.deepEqual(good.calls, ["duration", "tokens", "success"]);
+
+    const down = (async () => jsonResponse(500, {})) as typeof fetch;
+    const bad = recordingTracker();
+    await runJevPreclassification({ apiKey: "k", root: dir, baseRef: "main", tracker: bad.tracker, fetchImpl: down });
+    assert.deepEqual(bad.calls, ["error"]);
   });
 });

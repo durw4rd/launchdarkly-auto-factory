@@ -36,6 +36,17 @@ flag-implementer / metrics-author `default` variations — so a fresh install ge
 evidence-based judging out of the box. Judge-instruction edits reset score
 comparability — log them in the CHANGELOG.
 
+The **Jev pre-classifier** config (`autofactory-jev-preclassifier.json`, mode
+`completion`) is not an agent. It holds the question set for the optional Jev
+(TypeSafe AI) pre-classification layer: each variation carries its questions in
+`model.custom.questions` and the prefill bar in `model.parameters.minPrefillConfidence`,
+on the custom `TypeSafe.jev-latest` model config (`model-configs/`). Question
+names are the runtime contract (answers are read by name), so variations may
+reword or drop questions but must keep the names. Messages are documentation
+only. Because `bridge upgrade` syncs instructions/messages, not model custom
+params, edit the question set in LaunchDarkly (and A/B it with variations +
+the `autofactory-jev-agreement` event); the committed file is the seed.
+
 Two-way convention: after provisioning, instructions are editable in the
 LaunchDarkly UI and take effect on the next run. If you change them in LD,
 re-export to these files so the repo stays canonical, and log the change in

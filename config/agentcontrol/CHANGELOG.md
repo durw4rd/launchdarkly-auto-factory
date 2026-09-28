@@ -17,7 +17,26 @@ Status legend: ✅ done · 🔜 planned/in progress
 
 ## 2026-09-28 (Jev pre-classification, optional layer)
 
-### 🔜 New operational flag `auto-factory-jev-mode` (off / shadow / prefill)
+### ✅ New AI config `autofactory-jev-preclassifier` + custom model config `TypeSafe.jev-latest`
+- Completion-mode config holding the Jev question set, so wording can be edited and
+  A/B-tested in LaunchDarkly instead of in code. The `default` variation points at the
+  new custom model config `TypeSafe.jev-latest` (id `jev-latest`, provider TypeSafe,
+  input cost $42 per billion tokens), with the questions in `model.custom.questions`
+  and the prefill bar in `model.parameters.minPrefillConfidence` (0.7).
+- Question names are the runtime contract. Variations may reword or drop questions,
+  but must keep the names. Messages are documentation only.
+- Runtime: the tracker records duration, tokens, and success/error per variation. A
+  numeric `autofactory-jev-agreement` event (share of compared decisions where Jev
+  matched the agents, with the variation's track data) can back a metric for
+  experiments on question wording.
+- Falls back to the built-in questions when the config is missing, disabled, or
+  malformed.
+- Provisioned live via `bridge upgrade`, which now also creates custom model configs
+  from `config/agentcontrol/model-configs/`. Also fixed: upgrade compared `messages`
+  by raw JSON, so a `{role, content}` vs LD's `{content, role}` key order re-PATCHed
+  the config on every run.
+
+### ✅ New operational flag `auto-factory-jev-mode` (off / shadow / prefill)
 - Controls the optional Jev (TypeSafe AI) pre-classifier. It only takes effect when
   `TYPESAFE_API_KEY` is set; with a key and no flag provisioned yet, runs default to
   **shadow**.
@@ -30,8 +49,9 @@ Status legend: ✅ done · 🔜 planned/in progress
 - **prefill**: shadow, plus answers with confidence ≥ 0.7 go into the entry node's
   prompt as evidence. Tags are never seeded, so routing and approval gates are
   unchanged in every mode.
-- No AI config or graph changes. Status 🔜 until `bridge upgrade` creates the flag in
-  the live project.
+- Provisioned live with targeting OFF, which serves `off`. Turn targeting on (serves
+  `shadow`) to enable the layer. The shadow default applies only when the flag
+  doesn't exist at all.
 
 ## 2026-09-04 (issue intake entry point — ADR 0019)
 

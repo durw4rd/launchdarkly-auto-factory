@@ -19,12 +19,19 @@
 
 import { execFileSync } from "node:child_process";
 import type { LDClient, LDContext } from "@launchdarkly/node-server-sdk";
+import type { LDAIClient, LDAICompletionConfig, LDAIConfigTracker } from "@launchdarkly/server-sdk-ai";
 import { type JevAnswer, type JevQuestion, askJev, jevApiKey, jevConfidence } from "./client.js";
 
 export type JevMode = "off" | "shadow" | "prefill";
 export const JEV_MODE_FLAG_KEY = "auto-factory-jev-mode";
 /** LD custom event carrying each run's pre-classification + agreement with the agents. */
 export const JEV_EVENT_KEY = "autofactory-jev-preclassification";
+/**
+ * Numeric LD event: the fraction of compared decisions where Jev matched the
+ * agents, carrying the AI Config's track data (configKey, variationKey,
+ * version) — back a metric with it to A/B question wording per variation.
+ */
+export const JEV_AGREEMENT_EVENT_KEY = "autofactory-jev-agreement";
 /** Answers below this confidence are not surfaced to agents in prefill mode. */
 export const JEV_PREFILL_MIN_CONFIDENCE = 0.7;
 
@@ -113,92 +120,105 @@ function metricQuestionName(key: string, i: number): string {
   return `metric_${i}_${key.toLowerCase().replace(/[^a-z0-9]+/g, "_").slice(0, 40)}`;
 }
 
-export function buildPreclassifyQuestions(metrics: CandidateMetric[] = []): {
+/**
+ * The fixed question set — the code-side fallback. The live set comes from the
+ * `autofactory-jev-preclassifier` AI Config (variation `model.custom.questions`,
+ * see resolveJevConfig) so wording can be edited and A/B-tested in LaunchDarkly.
+ * The NAMES are the contract: interpretation and the shadow comparison read
+ * answers by these keys, so a variation may reword or drop questions but must
+ * keep the names. tests/jev.test.ts pins the committed config to this set.
+ */
+export const DEFAULT_JEV_QUESTIONS: Record<string, JevQuestion> = {
+  risk: {
+    type: "score",
+    instructions:
+      "How risky is this change to ship? Score the blast radius of the behavior change, not the line count. " +
+      "Any change to what a customer is charged or shown as a price is at least Moderate.",
+    criteria: RISK_LEVELS,
+  },
+  flag_worthy: {
+    type: "noul",
+    instructions: "Should this change be released behind a feature flag?",
+    criteria: {
+      true: "It changes user-facing behavior, business logic, an API, or an endpoint, so it should be gated and released progressively",
+      false: "It has no user-facing behavior change (docs, tests, dependencies, config, infrastructure, pure refactor)",
+    },
+  },
+  pr_type: {
+    type: "choice",
+    instructions: "What kind of change is this?",
+    criteria: {
+      feature: "Adds new functionality or behavior",
+      bugfix: "Fixes incorrect existing behavior",
+      refactor: "Restructures code without changing behavior",
+      config_change: "Changes configuration values only",
+      dependency_update: "Bumps or changes dependencies",
+      infrastructure: "Build, CI, deployment, or infrastructure code",
+      test_only: "Adds or changes tests only",
+      documentation: "Docs or comments only",
+    },
+  },
+  flag_type: {
+    type: "choice",
+    instructions: "If this change is flagged, which kind of flag fits it?",
+    criteria: {
+      release: "Temporary flag to roll out new or changed behavior, removed after full release",
+      kill_switch: "Permanent off-switch for a risky or expensive subsystem",
+      experiment: "A/B test of alternatives measured against a business metric",
+      operational: "Long-lived operational control or tuning (limits, timeouts, modes)",
+    },
+  },
+  flag_action: {
+    type: "choice",
+    instructions:
+      "Which flag action fits this change? Look for existing flag evaluations around the changed code in the diff.",
+    criteria: {
+      create: "Flag-worthy, and no existing flag gates the touched code: create a fresh flag",
+      ride_existing: "An existing flag gates this code and the change iterates on the flagged, not-yet-released variation",
+      extend_variation: "An existing multivariate flag gates this code, its variation is already released, and this is an iteration: add the next variation",
+      child_flag: "Net-new functionality inside or next to already-flagged code: create a new flag with the existing one as a prerequisite",
+      none: "Not flag-worthy at all",
+    },
+  },
+  feature_novelty: {
+    type: "choice",
+    instructions: "Is the behavior this change introduces a new path or a change to an existing one?",
+    criteria: {
+      net_new: "A new path (new endpoint or component) that users without the change never exercise",
+      incremental: "A change to an existing path that both old and new behavior exercise",
+      mixed: "Some surfaces are new, others are changed existing paths",
+    },
+  },
+  metric_backing: {
+    type: "choice",
+    instructions: "How should a guardrail metric for this change be measured, given the telemetry visible in the code?",
+    criteria: {
+      reuse_event: "The code already sends an analytics/track event that measures the affected behavior",
+      reuse_traces: "The affected code is already covered by tracing spans that can back a metric",
+      ride_o11y: "An observability SDK is installed; enabling its instrumentation covers the behavior without new events",
+      instrument_track: "Nothing measures this yet; a new track() event must be added",
+    },
+  },
+  release_method: {
+    type: "choice",
+    instructions: "How should this change be released once merged?",
+    criteria: {
+      immediate: "Turn it on for everyone at once; low risk and nothing meaningful to measure",
+      progressive: "Ramp it up in stages over time without metric-based automatic rollback",
+      guarded: "Ramp it up while monitoring metrics, rolling back automatically on a regression",
+    },
+  },
+};
+
+/** The base questions plus one yes/no per candidate metric (metric questions are always code-generated). */
+export function buildPreclassifyQuestions(
+  metrics: CandidateMetric[] = [],
+  base: Record<string, JevQuestion> = DEFAULT_JEV_QUESTIONS,
+): {
   questions: Record<string, JevQuestion>;
   metricByQuestion: Map<string, string>;
 } {
-  const questions: Record<string, JevQuestion> = {
-    risk: {
-      type: "score",
-      instructions:
-        "How risky is this change to ship? Score the blast radius of the behavior change, not the line count. " +
-        "Any change to what a customer is charged or shown as a price is at least Moderate.",
-      criteria: RISK_LEVELS,
-    },
-    flag_worthy: {
-      type: "noul",
-      instructions: "Should this change be released behind a feature flag?",
-      criteria: {
-        true: "It changes user-facing behavior, business logic, an API, or an endpoint, so it should be gated and released progressively",
-        false: "It has no user-facing behavior change (docs, tests, dependencies, config, infrastructure, pure refactor)",
-      },
-    },
-    pr_type: {
-      type: "choice",
-      instructions: "What kind of change is this?",
-      criteria: {
-        feature: "Adds new functionality or behavior",
-        bugfix: "Fixes incorrect existing behavior",
-        refactor: "Restructures code without changing behavior",
-        config_change: "Changes configuration values only",
-        dependency_update: "Bumps or changes dependencies",
-        infrastructure: "Build, CI, deployment, or infrastructure code",
-        test_only: "Adds or changes tests only",
-        documentation: "Docs or comments only",
-      },
-    },
-    flag_type: {
-      type: "choice",
-      instructions: "If this change is flagged, which kind of flag fits it?",
-      criteria: {
-        release: "Temporary flag to roll out new or changed behavior, removed after full release",
-        kill_switch: "Permanent off-switch for a risky or expensive subsystem",
-        experiment: "A/B test of alternatives measured against a business metric",
-        operational: "Long-lived operational control or tuning (limits, timeouts, modes)",
-      },
-    },
-    flag_action: {
-      type: "choice",
-      instructions:
-        "Which flag action fits this change? Look for existing flag evaluations around the changed code in the diff.",
-      criteria: {
-        create: "Flag-worthy, and no existing flag gates the touched code: create a fresh flag",
-        ride_existing: "An existing flag gates this code and the change iterates on the flagged, not-yet-released variation",
-        extend_variation: "An existing multivariate flag gates this code, its variation is already released, and this is an iteration: add the next variation",
-        child_flag: "Net-new functionality inside or next to already-flagged code: create a new flag with the existing one as a prerequisite",
-        none: "Not flag-worthy at all",
-      },
-    },
-    feature_novelty: {
-      type: "choice",
-      instructions: "Is the behavior this change introduces a new path or a change to an existing one?",
-      criteria: {
-        net_new: "A new path (new endpoint or component) that users without the change never exercise",
-        incremental: "A change to an existing path that both old and new behavior exercise",
-        mixed: "Some surfaces are new, others are changed existing paths",
-      },
-    },
-    metric_backing: {
-      type: "choice",
-      instructions: "How should a guardrail metric for this change be measured, given the telemetry visible in the code?",
-      criteria: {
-        reuse_event: "The code already sends an analytics/track event that measures the affected behavior",
-        reuse_traces: "The affected code is already covered by tracing spans that can back a metric",
-        ride_o11y: "An observability SDK is installed; enabling its instrumentation covers the behavior without new events",
-        instrument_track: "Nothing measures this yet; a new track() event must be added",
-      },
-    },
-    release_method: {
-      type: "choice",
-      instructions: "How should this change be released once merged?",
-      criteria: {
-        immediate: "Turn it on for everyone at once; low risk and nothing meaningful to measure",
-        progressive: "Ramp it up in stages over time without metric-based automatic rollback",
-        guarded: "Ramp it up while monitoring metrics, rolling back automatically on a regression",
-      },
-    },
-  };
-
+  const questions: Record<string, JevQuestion> = { ...base };
   const metricByQuestion = new Map<string, string>();
   metrics.slice(0, MAX_METRIC_QUESTIONS).forEach((m, i) => {
     const name = metricQuestionName(m.key, i);
@@ -262,8 +282,16 @@ function choiceDecision(a: JevAnswer | undefined): JevDecision | undefined {
   return { value: a.choice, confidence: a.confidence, probabilities: a.probabilities };
 }
 
-/** Expected risk level (fractional) → the 0..1 risk_score scale, linearly interpolated. */
-export function riskScoreFromLevel(level: number): number {
+/**
+ * Expected risk level (fractional) → the 0..1 risk_score scale, linearly
+ * interpolated over the planner's anchors. A config-supplied rubric with a
+ * different number of levels maps linearly onto 0.1..0.9.
+ */
+export function riskScoreFromLevel(level: number, levels = RISK_SCORE_AT_LEVEL.length): number {
+  if (levels !== RISK_SCORE_AT_LEVEL.length) {
+    const max = Math.max(levels - 1, 1);
+    return 0.1 + (0.8 * Math.min(Math.max(level, 0), max)) / max;
+  }
   const max = RISK_SCORE_AT_LEVEL.length - 1;
   const x = Math.min(Math.max(level, 0), max);
   const lo = Math.floor(x);
@@ -281,7 +309,8 @@ export function interpretJevAnswers(
 
   const risk = answers.risk;
   if (risk?.type === "score") {
-    decisions.risk_score = { value: riskScoreFromLevel(risk.score).toFixed(2), confidence: risk.confidence };
+    const levels = Object.keys(risk.legend ?? {}).length || RISK_SCORE_AT_LEVEL.length;
+    decisions.risk_score = { value: riskScoreFromLevel(risk.score, levels).toFixed(2), confidence: risk.confidence };
   }
   const worthy = answers.flag_worthy;
   if (worthy?.type === "noul") {
@@ -309,6 +338,89 @@ export function interpretJevAnswers(
   return { decisions, metrics };
 }
 
+// ── LaunchDarkly AI Config ────────────────────────────────────────────────
+
+/**
+ * The AI Config that carries the question set. Completion mode; each variation
+ * points at the TypeSafe custom model config and holds its questions in
+ * `model.custom.questions` (same shape as DEFAULT_JEV_QUESTIONS) and the prefill
+ * bar in `model.parameters.minPrefillConfidence`. The messages are unused (Jev
+ * has no chat turns; its input is the diff) and only document the config.
+ */
+export const JEV_AI_CONFIG_KEY = "autofactory-jev-preclassifier";
+
+export interface JevRuntimeConfig {
+  /** Where the questions came from — the AI Config variation, or the code fallback. */
+  source: "ai-config" | "code";
+  questions: Record<string, JevQuestion>;
+  model?: string;
+  minPrefillConfidence: number;
+  /** Variation key, when source is ai-config. */
+  variation?: string;
+  tracker?: LDAIConfigTracker;
+}
+
+/** Structural check of config-supplied questions (the API limits are checked by askJev). */
+function isJevQuestion(q: unknown): q is JevQuestion {
+  if (!q || typeof q !== "object") return false;
+  const { type, instructions, criteria } = q as Record<string, unknown>;
+  if (typeof instructions !== "string" || !criteria || typeof criteria !== "object") return false;
+  if (type === "score") return Array.isArray(criteria) && criteria.every((c) => typeof c === "string");
+  if (type === "noul") {
+    const c = criteria as Record<string, unknown>;
+    return typeof c.true === "string" && typeof c.false === "string";
+  }
+  return type === "choice" && !Array.isArray(criteria);
+}
+
+/**
+ * Resolve the question set from the AI Config. Falls back to the code defaults
+ * (with a log line) when the config is missing, disabled, or malformed — the
+ * layer must keep working on projects that haven't run `bridge upgrade`.
+ */
+export async function resolveJevConfig(
+  aiClient: LDAIClient,
+  context: LDContext,
+  variables?: Record<string, unknown>,
+): Promise<JevRuntimeConfig> {
+  const fallback: JevRuntimeConfig = {
+    source: "code",
+    questions: DEFAULT_JEV_QUESTIONS,
+    minPrefillConfidence: JEV_PREFILL_MIN_CONFIDENCE,
+  };
+  let cfg: LDAICompletionConfig;
+  try {
+    cfg = await aiClient.completionConfig(JEV_AI_CONFIG_KEY, context, { enabled: false }, variables);
+  } catch (e) {
+    console.warn(`[jev] AI Config '${JEV_AI_CONFIG_KEY}' evaluation failed — using built-in questions: ${e instanceof Error ? e.message : e}`);
+    return fallback;
+  }
+  if (!cfg.enabled) {
+    console.log(`[jev] AI Config '${JEV_AI_CONFIG_KEY}' not found or disabled — using built-in questions.`);
+    return fallback;
+  }
+  const tracker = cfg.createTracker?.();
+  const raw = cfg.model?.custom?.questions;
+  const entries = raw && typeof raw === "object" ? Object.entries(raw as Record<string, unknown>) : [];
+  const invalid = entries.filter(([, q]) => !isJevQuestion(q)).map(([k]) => k);
+  if (entries.length === 0 || invalid.length > 0) {
+    console.warn(
+      `[jev] AI Config '${JEV_AI_CONFIG_KEY}' has ${entries.length === 0 ? "no model.custom.questions" : `malformed question(s): ${invalid.join(", ")}`} — using built-in questions.`,
+    );
+    return { ...fallback, ...(tracker ? { tracker } : {}) };
+  }
+  const min = Number(cfg.model?.parameters?.minPrefillConfidence);
+  const variation = tracker?.getTrackData().variationKey;
+  return {
+    source: "ai-config",
+    questions: Object.fromEntries(entries) as Record<string, JevQuestion>,
+    ...(cfg.model?.name ? { model: cfg.model.name } : {}),
+    minPrefillConfidence: Number.isFinite(min) && min > 0 && min <= 1 ? min : JEV_PREFILL_MIN_CONFIDENCE,
+    ...(variation ? { variation } : {}),
+    ...(tracker ? { tracker } : {}),
+  };
+}
+
 // ── Run ───────────────────────────────────────────────────────────────────
 
 export interface PreclassifyInput {
@@ -319,6 +431,12 @@ export interface PreclassifyInput {
   title?: string;
   body?: string;
   metrics?: CandidateMetric[];
+  /** Base question set (the AI Config's); defaults to DEFAULT_JEV_QUESTIONS. */
+  questions?: Record<string, JevQuestion>;
+  /** Jev model id (the AI Config's model name); defaults to jev-latest. */
+  model?: string;
+  /** AI Config tracker: duration, tokens, success/error land on the variation. */
+  tracker?: LDAIConfigTracker;
   /** Test seam. */
   fetchImpl?: typeof fetch;
 }
@@ -336,7 +454,7 @@ export async function runJevPreclassification(input: PreclassifyInput): Promise<
       console.log("[jev] no diff against the base — pre-classification skipped");
       return undefined;
     }
-    const { questions, metricByQuestion } = buildPreclassifyQuestions(candidateMetrics(input.metrics ?? []));
+    const { questions, metricByQuestion } = buildPreclassifyQuestions(candidateMetrics(input.metrics ?? []), input.questions);
     const state = {
       title: input.title ?? "",
       description: (input.body ?? "").slice(0, MAX_BODY_CHARS),
@@ -344,12 +462,35 @@ export async function runJevPreclassification(input: PreclassifyInput): Promise<
       diff: evidence.diff,
     };
     const start = Date.now();
-    const res = await askJev({ apiKey, state, questions, ...(input.fetchImpl ? { fetchImpl: input.fetchImpl } : {}) });
+    let res;
+    try {
+      res = await askJev({
+        apiKey,
+        state,
+        questions,
+        ...(input.model ? { model: input.model } : {}),
+        ...(input.fetchImpl ? { fetchImpl: input.fetchImpl } : {}),
+      });
+    } catch (e) {
+      input.tracker?.trackError();
+      throw e;
+    }
     const latencyMs = Date.now() - start;
+    const inputTokens = res.usage?.input_tokens;
+    const outputTokens = res.usage?.output_tokens;
+    if (input.tracker) {
+      input.tracker.trackDuration(latencyMs);
+      if (inputTokens !== undefined || outputTokens !== undefined) {
+        const i = inputTokens ?? 0;
+        const o = outputTokens ?? 0;
+        input.tracker.trackTokens({ total: i + o, input: i, output: o });
+      }
+      input.tracker.trackSuccess();
+    }
     return {
       model: res.model,
       latencyMs,
-      ...(res.usage?.input_tokens !== undefined ? { inputTokens: res.usage.input_tokens } : {}),
+      ...(inputTokens !== undefined ? { inputTokens } : {}),
       diffTruncated: evidence.truncated,
       ...interpretJevAnswers(res.answers, metricByQuestion),
     };
@@ -493,6 +634,7 @@ export function jevEventData(pre: JevPreclassification, rows: JevComparisonRow[]
 export interface JevLayer {
   mode: JevMode;
   pre?: JevPreclassification;
+  config?: JevRuntimeConfig;
 }
 
 /**
@@ -502,6 +644,10 @@ export interface JevLayer {
 export async function startJevLayer(opts: {
   ldClient: LDClient;
   ldContext: LDContext;
+  /** Resolves the question set from the AI Config; without it the built-in questions are used. */
+  aiClient?: LDAIClient;
+  /** AI Config instruction variables (same map the agent configs get). */
+  variables?: Record<string, unknown>;
   context: Record<string, unknown>;
   root: string;
   baseRef?: string;
@@ -527,26 +673,33 @@ export async function startJevLayer(opts: {
       console.warn(`[jev] could not list app-project metrics (non-fatal): ${e instanceof Error ? e.message : e}`);
     }
   }
+  const config: JevRuntimeConfig = opts.aiClient
+    ? await resolveJevConfig(opts.aiClient, opts.ldContext, opts.variables)
+    : { source: "code", questions: DEFAULT_JEV_QUESTIONS, minPrefillConfidence: JEV_PREFILL_MIN_CONFIDENCE };
   const pre = await runJevPreclassification({
     root: opts.root,
+    questions: config.questions,
+    ...(config.model ? { model: config.model } : {}),
+    ...(config.tracker ? { tracker: config.tracker } : {}),
     ...(opts.baseRef ? { baseRef: opts.baseRef } : {}),
     ...(opts.workingTree ? { workingTree: true } : {}),
     ...(typeof opts.context.PR_TITLE === "string" ? { title: opts.context.PR_TITLE } : {}),
     ...(typeof opts.context.PR_BODY === "string" ? { body: opts.context.PR_BODY } : {}),
     metrics,
   });
-  if (!pre) return { mode };
+  if (!pre) return { mode, config };
   const summary = JEV_DECISIONS.map((n) => pre.decisions[n])
     .map((d, i) => (d ? `${JEV_DECISIONS[i]}=${d.value}@${d.confidence.toFixed(2)}` : ""))
     .filter(Boolean)
     .join(" ");
-  console.log(`Jev pre-classification: ${mode} — ${pre.latencyMs}ms, ${pre.model}: ${summary}`);
+  const from = config.source === "ai-config" ? `${JEV_AI_CONFIG_KEY}/${config.variation ?? "?"}` : "built-in questions";
+  console.log(`Jev pre-classification: ${mode} — ${pre.latencyMs}ms, ${pre.model}, ${from}: ${summary}`);
   if (mode === "prefill") {
-    const hints = formatJevHints(pre);
+    const hints = formatJevHints(pre, config.minPrefillConfidence);
     if (hints) opts.context.PRECLASSIFICATION = hints;
     console.log(`Jev prefill: ${hints ? "confident answers added to the entry node's prompt" : "no answer cleared the confidence bar"}.`);
   }
-  return { mode, pre };
+  return { mode, pre, config };
 }
 
 /**
@@ -567,7 +720,17 @@ export function finishJevLayer(
     // The research planner is the node that emits the risk / flag-worthiness tags.
     const planner = opts.runs.find((r) => r.tags.risk_score !== undefined || r.tags.flag_worthy !== undefined);
     const rows = compareJevWithAgents(layer.pre, opts.tags, planner?.output);
-    opts.ldClient.track(JEV_EVENT_KEY, opts.ldContext, jevEventData(layer.pre, rows, layer.mode));
+    const trackData = layer.config?.tracker?.getTrackData();
+    opts.ldClient.track(JEV_EVENT_KEY, opts.ldContext, {
+      ...jevEventData(layer.pre, rows, layer.mode),
+      questionSource: layer.config?.source ?? "code",
+      ...(trackData ? { trackData } : {}),
+    });
+    const compared = rows.filter((r) => r.agree !== undefined);
+    if (compared.length > 0) {
+      const agreement = compared.filter((r) => r.agree).length / compared.length;
+      opts.ldClient.track(JEV_AGREEMENT_EVENT_KEY, opts.ldContext, trackData ?? { questionSource: "code" }, agreement);
+    }
     return formatJevComparison(layer.pre, rows, layer.mode);
   } catch (e) {
     console.warn(`[jev] comparison failed (non-fatal): ${e instanceof Error ? e.message : e}`);

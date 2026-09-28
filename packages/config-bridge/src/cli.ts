@@ -66,6 +66,7 @@ function logProvision(r: Awaited<ReturnType<typeof provision>>): void {
   console.log(`Flags:      ${r.flagsCreated.length} created, ${r.flagsExisting.length} existing`);
   console.log(`Tools:      ${r.toolsCreated.length} created, ${r.toolsExisting.length} existing`);
   console.log(`Metrics:    ${r.metricsCreated.length} created, ${r.metricsExisting.length} existing (APP project)`);
+  console.log(`Models:     ${r.modelConfigsCreated.length} created, ${r.modelConfigsExisting.length} existing (custom model configs)`);
   if (r.toolsStripped.length) {
     console.log(`⚠ tools stripped from ${r.toolsStripped.length} variation(s) — our snapshots hold only tool/snippet references, not definitions, so re-attach them in LD if the provider needs them`);
   }

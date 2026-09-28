@@ -37,6 +37,9 @@ export interface ProvisionResult {
   /** APP-project metrics (config/agentcontrol/metrics/) created / found. */
   metricsCreated: string[];
   metricsExisting: string[];
+  /** Custom model configs (config/agentcontrol/model-configs/) created / found. */
+  modelConfigsCreated: string[];
+  modelConfigsExisting: string[];
 }
 
 /** A tool-definition file (config/agentcontrol/tools/<key>.json), in the
@@ -470,6 +473,42 @@ async function applyFlagTargeting(ld: LdClient, flag: FlagFile, result: Provisio
 }
 
 /** Create an operational flag if absent (idempotent; existing flag left untouched). */
+/**
+ * A custom model config (config/agentcontrol/model-configs/*.json) — a model
+ * that isn't in LaunchDarkly's built-in catalog (e.g. TypeSafe's Jev), in the
+ * shape the model-configs API consumes. AI-config variations reference it by
+ * `modelConfigKey`, so it must exist before any variation that uses it.
+ */
+export interface ModelConfigFile {
+  key: string;
+  name: string;
+  id: string;
+  provider?: string;
+  params?: Record<string, unknown>;
+  customParams?: Record<string, unknown>;
+  costPerInputToken?: number;
+  costPerOutputToken?: number;
+  tags?: string[];
+}
+
+/** Create-only, like tools: an existing model config (and its LD-side edits) is never touched. */
+async function provisionModelConfig(ld: LdClient, mc: ModelConfigFile, result: ProvisionResult, dryRun: boolean): Promise<void> {
+  const path = `/api/v2/projects/${ld.projectKey}/ai-configs/model-configs`;
+  const beta = { "LD-API-Version": "beta" };
+  try {
+    const existing = await ld.request({ path: `${path}/${encodeURIComponent(mc.key)}`, headers: beta, okStatuses: [404] });
+    if (existing.status === 200) {
+      result.modelConfigsExisting.push(mc.key);
+      return;
+    }
+    if (!dryRun) await ld.request({ method: "POST", path, headers: beta, body: mc });
+    result.modelConfigsCreated.push(mc.key);
+  } catch (e) {
+    const err = e as LdApiError;
+    result.failures.push({ resource: `model-config ${mc.key}`, status: err.status ?? 0, message: err.responseBody ?? String(e) });
+  }
+}
+
 async function provisionFlag(ld: LdClient, flag: FlagFile, result: ProvisionResult, dryRun: boolean): Promise<void> {
   // 404-tolerant existence check, so an already-configured flag (and its
   // targeting) is never overwritten.
@@ -581,6 +620,11 @@ export interface ProvisionOptions {
    * metrics (sentry-errors*). When omitted, metrics are skipped with a log.
    */
   appLd?: LdClient;
+  /**
+   * Directory of custom model-config JSON files. Default
+   * `config/agentcontrol/model-configs`. Provisioned before AI configs.
+   */
+  modelConfigsDir?: string;
   /** When true, perform reads only — report what would be created without writing. */
   dryRun?: boolean;
 }
@@ -590,7 +634,7 @@ export async function provision(ld: LdClient, opts: ProvisionOptions): Promise<P
     configsCreated: [], configsExisting: [], variationsCreated: 0, variationsExisting: 0,
     toolsStripped: [], toolsCreated: [], toolsExisting: [],
     failures: [], graphsCreated: [], graphsExisting: [], flagsCreated: [], flagsExisting: [],
-    metricsCreated: [], metricsExisting: [],
+    metricsCreated: [], metricsExisting: [], modelConfigsCreated: [], modelConfigsExisting: [],
   };
   const dryRun = opts.dryRun ?? false;
   const toolsDir = opts.toolsDir ?? "config/agentcontrol/tools";
@@ -598,6 +642,12 @@ export async function provision(ld: LdClient, opts: ProvisionOptions): Promise<P
   // Tools first: variations reference them as {key, version}, so the library
   // must exist before any variation create.
   const toolVersions = await provisionTools(ld, toolsDir, result, dryRun);
+
+  // Custom model configs next: variations reference them by modelConfigKey.
+  for (const file of listJson(opts.modelConfigsDir ?? "config/agentcontrol/model-configs")) {
+    const mc = JSON.parse(readFileSync(file, "utf8")) as ModelConfigFile;
+    await provisionModelConfig(ld, mc, result, dryRun);
+  }
 
   // Judge-mode configs next: agent variations may carry a `judgeConfiguration`
   // that references a judge by key, so the judges must exist before the agents.

@@ -591,6 +591,8 @@ async function main(): Promise<void> {
   const jev = await startJevLayer({
     ldClient,
     ldContext,
+    aiClient,
+    variables: buildVariables(context),
     context,
     root: sandboxRoot,
     ...(process.env.PR_BASE_REF ? { baseRef: process.env.PR_BASE_REF } : {}),

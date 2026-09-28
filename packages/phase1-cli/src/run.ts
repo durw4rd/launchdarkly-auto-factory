@@ -388,6 +388,8 @@ async function run(opts: CliOptions): Promise<number> {
   const jev = await startJevLayer({
     ldClient,
     ldContext,
+    aiClient,
+    variables: variables,
     context,
     root,
     ...(state.resolvedBase ? { baseRef: state.resolvedBase } : {}),

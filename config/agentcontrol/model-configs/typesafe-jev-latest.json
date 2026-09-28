@@ -1,0 +1,10 @@
+{
+  "key": "TypeSafe.jev-latest",
+  "name": "Jev (latest)",
+  "id": "jev-latest",
+  "provider": "TypeSafe",
+  "params": {},
+  "customParams": {},
+  "costPerInputToken": 4.2e-8,
+  "tags": ["auto-factory"]
+}

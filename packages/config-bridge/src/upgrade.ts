@@ -100,6 +100,21 @@ export interface UpgradeOptions {
   dryRun?: boolean;
 }
 
+/**
+ * Order-insensitive form of a messages array for diffing: LD returns each
+ * message as {content, role}, while committed files may write {role, content},
+ * and a raw JSON.stringify compare re-PATCHed such configs on every upgrade.
+ */
+function messagesKey(messages: unknown): string {
+  if (!Array.isArray(messages)) return JSON.stringify(messages ?? null);
+  return JSON.stringify(
+    messages.map((m) => {
+      const { role, content } = (m ?? {}) as { role?: unknown; content?: unknown };
+      return [role, content];
+    }),
+  );
+}
+
 export async function upgrade(ld: LdClient, opts: UpgradeOptions): Promise<UpgradeResult> {
   const dryRun = opts.dryRun ?? false;
 
@@ -161,7 +176,7 @@ export async function upgrade(ld: LdClient, opts: UpgradeOptions): Promise<Upgra
         if (!lv) continue; // just created (or create failed) — content already committed-shaped
         const patch: Record<string, unknown> = {};
         if (v.instructions !== undefined && v.instructions !== lv.instructions) patch.instructions = v.instructions;
-        if (v.messages !== undefined && JSON.stringify(v.messages) !== JSON.stringify(lv.messages)) patch.messages = v.messages;
+        if (v.messages !== undefined && messagesKey(v.messages) !== messagesKey(lv.messages)) patch.messages = v.messages;
         if (v.judgeConfiguration !== undefined && lv.judgeConfiguration === undefined) patch.judgeConfiguration = v.judgeConfiguration;
         // Tool attachments: committed NAME list is canonical (same convention
         // as instructions). Desired refs point at the CURRENT tool versions,
