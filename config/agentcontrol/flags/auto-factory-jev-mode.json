@@ -1,0 +1,31 @@
+{
+  "key": "auto-factory-jev-mode",
+  "name": "AutoFactory Jev pre-classification mode",
+  "description": "How much the pipeline trusts the optional Jev (TypeSafe AI) pre-classifier. It only takes effect when TYPESAFE_API_KEY is set; without a key the layer is off whatever this flag serves. Before the chain runs, one Jev request answers the typed decisions the agents otherwise make inside their loops: risk_score, flag_worthy, pr_type/skip_flagging, flag_type, flag_action, feature_novelty, metric_backing, release_method, and which existing metrics the change could move. shadow = log the answers, compare them with the agents' decisions after the walk, and emit the autofactory-jev-preclassification event; agents never see them. prefill = shadow plus confident answers (>= 0.7) go into the entry node's prompt as evidence. Routing tags and approval gates always read the agents' own tags.",
+  "kind": "multivariate",
+  "temporary": false,
+  "tags": [
+    "auto-factory"
+  ],
+  "variations": [
+    {
+      "value": "off",
+      "name": "Off",
+      "description": "No Jev request, even when a key is set."
+    },
+    {
+      "value": "shadow",
+      "name": "Shadow",
+      "description": "Ask, log, and compare with the agents; agents never see the answers."
+    },
+    {
+      "value": "prefill",
+      "name": "Prefill",
+      "description": "Shadow, plus confident answers go into the entry node's prompt as evidence."
+    }
+  ],
+  "defaults": {
+    "onVariation": 1,
+    "offVariation": 0
+  }
+}

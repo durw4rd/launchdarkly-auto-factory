@@ -78,6 +78,8 @@ jobs:
           # 50/50 anthropic/cursor split, so the anthropic arm needs its key here too.
           ANTHROPIC_API_KEY:    ${{ secrets.ANTHROPIC_API_KEY }}
           LD_API_KEY:           ${{ secrets.LD_API_KEY }}
+          # Optional: Jev pre-classification (auto-factory-jev-mode flag; shadow by default).
+          TYPESAFE_API_KEY:     ${{ secrets.TYPESAFE_API_KEY }}
           LD_APP_PROJECT_KEY:   ${{ vars.LD_APP_PROJECT_KEY }}   # e.g. autofactory-demo
           GRAPH_KEY:            gha-auto-factory
           ENABLE_FLAG_CREATION: "true"   # create real flags/metrics in the app project

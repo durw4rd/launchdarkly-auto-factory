@@ -71931,7 +71931,7 @@ var require_dist_cjs50 = __commonJS({
 });
 
 // src/action.ts
-import { execFileSync as execFileSync4 } from "node:child_process";
+import { execFileSync as execFileSync5 } from "node:child_process";
 import { existsSync as existsSync6, readFileSync as readFileSync8, writeFileSync as writeFileSync2 } from "node:fs";
 import { dirname as dirname5, join as join12, resolve as resolve7 } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -74736,9 +74736,12 @@ function buildPrompt(hasInbound, ctx) {
     ctx.PR_TITLE ? `Title: ${ctx.PR_TITLE}` : ""
   ].filter(Boolean).join("\n");
   if (!hasInbound) {
+    const pre = typeof ctx.PRECLASSIFICATION === "string" ? `
+
+${ctx.PRECLASSIFICATION}` : "";
     return `${header}${ctx.PR_BODY ? `
 
-${ctx.PR_BODY}` : ""}`.trim();
+${ctx.PR_BODY}` : ""}${pre}`.trim();
   }
   const brief = typeof ctx.PREVIOUS_STEP_OUTPUT === "string" ? ctx.PREVIOUS_STEP_OUTPUT : "";
   return `${header}
@@ -80034,6 +80037,445 @@ function intentTicketId(body) {
   return parseIntentMarker(body)?.intent;
 }
 
+// ../shared/dist/jev/client.js
+var JEV_ENDPOINT = "https://api.typesafe.ai/v1/systemone";
+var JEV_DEFAULT_MODEL = "jev-latest";
+var JEV_MAX_CHOICE_OPTIONS = 255;
+var JEV_MAX_SCORE_LEVELS = 10;
+function jevApiKey() {
+  return process.env.TYPESAFE_API_KEY || void 0;
+}
+function validateJevQuestions(questions) {
+  for (const [name, q3] of Object.entries(questions)) {
+    if (q3.type === "choice") {
+      const n3 = Object.keys(q3.criteria).length;
+      if (n3 < 2 || n3 > JEV_MAX_CHOICE_OPTIONS) {
+        throw new Error(`jev: choice '${name}' has ${n3} options (2\u2013${JEV_MAX_CHOICE_OPTIONS})`);
+      }
+    } else if (q3.type === "score") {
+      const n3 = q3.criteria.length;
+      if (n3 < 2 || n3 > JEV_MAX_SCORE_LEVELS) {
+        throw new Error(`jev: score '${name}' has ${n3} levels (2\u2013${JEV_MAX_SCORE_LEVELS})`);
+      }
+    }
+  }
+}
+var RETRYABLE = /* @__PURE__ */ new Set([429, 529, 502, 503]);
+async function askJev(req) {
+  validateJevQuestions(req.questions);
+  const doFetch = req.fetchImpl ?? fetch;
+  const maxRetries = req.maxRetries ?? 3;
+  const body = JSON.stringify({ model: req.model ?? JEV_DEFAULT_MODEL, state: req.state, questions: req.questions });
+  let lastError = "";
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    if (attempt > 0)
+      await new Promise((r6) => setTimeout(r6, 500 * 2 ** (attempt - 1)));
+    let res;
+    try {
+      res = await doFetch(JEV_ENDPOINT, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${req.apiKey}`, "Content-Type": "application/json" },
+        body,
+        signal: AbortSignal.timeout(req.timeoutMs ?? 2e4)
+      });
+    } catch (e6) {
+      lastError = e6 instanceof Error ? e6.message : String(e6);
+      continue;
+    }
+    if (res.ok)
+      return await res.json();
+    const text = (await res.text().catch(() => "")).slice(0, 300);
+    lastError = `HTTP ${res.status}${text ? `: ${text}` : ""}`;
+    if (!RETRYABLE.has(res.status))
+      break;
+  }
+  throw new Error(`jev request failed: ${lastError}`);
+}
+function jevConfidence(answer) {
+  return answer.type === "noul" ? Math.max(answer.noul, 1 - answer.noul) : answer.confidence;
+}
+
+// ../shared/dist/jev/preclassify.js
+import { execFileSync as execFileSync4 } from "node:child_process";
+var JEV_MODE_FLAG_KEY = "auto-factory-jev-mode";
+var JEV_EVENT_KEY = "autofactory-jev-preclassification";
+var JEV_PREFILL_MIN_CONFIDENCE = 0.7;
+var MAX_DIFF_CHARS = 6e4;
+var MAX_BODY_CHARS = 4e3;
+var MAX_METRIC_QUESTIONS = 60;
+var SKIP_PR_TYPES = /* @__PURE__ */ new Set(["config_change", "dependency_update", "infrastructure", "test_only", "documentation"]);
+async function resolveJevMode(ldClient, context) {
+  if (!jevApiKey())
+    return "off";
+  const v = await ldClient.variation(JEV_MODE_FLAG_KEY, context, "shadow");
+  return v === "off" || v === "prefill" ? v : "shadow";
+}
+function collectChangeEvidence(root6, opts = {}) {
+  const git2 = (args) => execFileSync4("git", args, { cwd: root6, encoding: "utf8", maxBuffer: 64 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] });
+  const name = opts.baseRef || process.env.PR_BASE_REF || "main";
+  for (const ref of [`origin/${name}`, name, "origin/main", "main"]) {
+    let mergeBase;
+    try {
+      mergeBase = git2(["merge-base", ref, "HEAD"]).trim();
+    } catch {
+      continue;
+    }
+    const exclude = [":(exclude)package-lock.json", ":(exclude)yarn.lock", ":(exclude)pnpm-lock.yaml"];
+    const range2 = opts.workingTree ? [mergeBase] : [mergeBase, "HEAD"];
+    const changedFiles = git2(["diff", "--name-only", ...range2]).split("\n").map((l4) => l4.trim()).filter(Boolean);
+    if (opts.workingTree) {
+      for (const f6 of git2(["ls-files", "--others", "--exclude-standard"]).split("\n"))
+        if (f6.trim())
+          changedFiles.push(f6.trim());
+    }
+    const full = git2(["diff", ...range2, "--", ".", ...exclude]);
+    const truncated = full.length > MAX_DIFF_CHARS;
+    return { diff: truncated ? `${full.slice(0, MAX_DIFF_CHARS)}
+\u2026[diff truncated]` : full, changedFiles, truncated };
+  }
+  return void 0;
+}
+var RISK_LEVELS = [
+  "Trivial: docs, tests, comments, or formatting only; no runtime behavior change",
+  "Low: small additive, isolated change (new endpoint, copy change) with a narrow blast radius",
+  "Moderate: modified business logic or shared code with a moderate blast radius",
+  "High: cross-cutting change, API contract change, or data migration",
+  "Critical: touches auth, payments, pricing/totals, or data integrity"
+];
+var RISK_SCORE_AT_LEVEL = [0.1, 0.25, 0.5, 0.75, 0.9];
+function metricQuestionName(key, i6) {
+  return `metric_${i6}_${key.toLowerCase().replace(/[^a-z0-9]+/g, "_").slice(0, 40)}`;
+}
+function buildPreclassifyQuestions(metrics = []) {
+  const questions = {
+    risk: {
+      type: "score",
+      instructions: "How risky is this change to ship? Score the blast radius of the behavior change, not the line count. Any change to what a customer is charged or shown as a price is at least Moderate.",
+      criteria: RISK_LEVELS
+    },
+    flag_worthy: {
+      type: "noul",
+      instructions: "Should this change be released behind a feature flag?",
+      criteria: {
+        true: "It changes user-facing behavior, business logic, an API, or an endpoint, so it should be gated and released progressively",
+        false: "It has no user-facing behavior change (docs, tests, dependencies, config, infrastructure, pure refactor)"
+      }
+    },
+    pr_type: {
+      type: "choice",
+      instructions: "What kind of change is this?",
+      criteria: {
+        feature: "Adds new functionality or behavior",
+        bugfix: "Fixes incorrect existing behavior",
+        refactor: "Restructures code without changing behavior",
+        config_change: "Changes configuration values only",
+        dependency_update: "Bumps or changes dependencies",
+        infrastructure: "Build, CI, deployment, or infrastructure code",
+        test_only: "Adds or changes tests only",
+        documentation: "Docs or comments only"
+      }
+    },
+    flag_type: {
+      type: "choice",
+      instructions: "If this change is flagged, which kind of flag fits it?",
+      criteria: {
+        release: "Temporary flag to roll out new or changed behavior, removed after full release",
+        kill_switch: "Permanent off-switch for a risky or expensive subsystem",
+        experiment: "A/B test of alternatives measured against a business metric",
+        operational: "Long-lived operational control or tuning (limits, timeouts, modes)"
+      }
+    },
+    flag_action: {
+      type: "choice",
+      instructions: "Which flag action fits this change? Look for existing flag evaluations around the changed code in the diff.",
+      criteria: {
+        create: "Flag-worthy, and no existing flag gates the touched code: create a fresh flag",
+        ride_existing: "An existing flag gates this code and the change iterates on the flagged, not-yet-released variation",
+        extend_variation: "An existing multivariate flag gates this code, its variation is already released, and this is an iteration: add the next variation",
+        child_flag: "Net-new functionality inside or next to already-flagged code: create a new flag with the existing one as a prerequisite",
+        none: "Not flag-worthy at all"
+      }
+    },
+    feature_novelty: {
+      type: "choice",
+      instructions: "Is the behavior this change introduces a new path or a change to an existing one?",
+      criteria: {
+        net_new: "A new path (new endpoint or component) that users without the change never exercise",
+        incremental: "A change to an existing path that both old and new behavior exercise",
+        mixed: "Some surfaces are new, others are changed existing paths"
+      }
+    },
+    metric_backing: {
+      type: "choice",
+      instructions: "How should a guardrail metric for this change be measured, given the telemetry visible in the code?",
+      criteria: {
+        reuse_event: "The code already sends an analytics/track event that measures the affected behavior",
+        reuse_traces: "The affected code is already covered by tracing spans that can back a metric",
+        ride_o11y: "An observability SDK is installed; enabling its instrumentation covers the behavior without new events",
+        instrument_track: "Nothing measures this yet; a new track() event must be added"
+      }
+    },
+    release_method: {
+      type: "choice",
+      instructions: "How should this change be released once merged?",
+      criteria: {
+        immediate: "Turn it on for everyone at once; low risk and nothing meaningful to measure",
+        progressive: "Ramp it up in stages over time without metric-based automatic rollback",
+        guarded: "Ramp it up while monitoring metrics, rolling back automatically on a regression"
+      }
+    }
+  };
+  const metricByQuestion = /* @__PURE__ */ new Map();
+  metrics.slice(0, MAX_METRIC_QUESTIONS).forEach((m4, i6) => {
+    const name = metricQuestionName(m4.key, i6);
+    metricByQuestion.set(name, m4.key);
+    questions[name] = {
+      type: "noul",
+      instructions: `Could this change plausibly move the metric "${m4.name ?? m4.key}" (key ${m4.key}${m4.kind ? `, ${m4.kind}` : ""})? Yes only if the change touches code that emits or affects what this metric measures.`,
+      criteria: {
+        true: "The change affects the behavior or code path this metric measures",
+        false: "The change is unrelated to this metric"
+      }
+    };
+  });
+  return { questions, metricByQuestion };
+}
+function candidateMetrics(metrics) {
+  return metrics.filter((m4) => !m4.key.startsWith("$ld:ai:") && !m4.key.startsWith("ld_autogen__ai-"));
+}
+var JEV_DECISIONS = [
+  "risk_score",
+  "flag_worthy",
+  "pr_type",
+  "skip_flagging",
+  "flag_type",
+  "flag_action",
+  "feature_novelty",
+  "metric_backing",
+  "release_method"
+];
+function choiceDecision(a6) {
+  if (!a6 || a6.type !== "choice")
+    return void 0;
+  return { value: a6.choice, confidence: a6.confidence, probabilities: a6.probabilities };
+}
+function riskScoreFromLevel(level) {
+  const max = RISK_SCORE_AT_LEVEL.length - 1;
+  const x = Math.min(Math.max(level, 0), max);
+  const lo = Math.floor(x);
+  const hi = Math.min(lo + 1, max);
+  const a6 = RISK_SCORE_AT_LEVEL[lo];
+  const b6 = RISK_SCORE_AT_LEVEL[hi];
+  return a6 + (b6 - a6) * (x - lo);
+}
+function interpretJevAnswers(answers, metricByQuestion) {
+  const decisions = {};
+  const risk = answers.risk;
+  if (risk?.type === "score") {
+    decisions.risk_score = { value: riskScoreFromLevel(risk.score).toFixed(2), confidence: risk.confidence };
+  }
+  const worthy = answers.flag_worthy;
+  if (worthy?.type === "noul") {
+    decisions.flag_worthy = { value: worthy.noul >= 0.5 ? "true" : "false", confidence: jevConfidence(worthy) };
+  }
+  for (const name of ["pr_type", "flag_type", "flag_action", "feature_novelty", "metric_backing", "release_method"]) {
+    const d6 = choiceDecision(answers[name]);
+    if (d6)
+      decisions[name] = d6;
+  }
+  if (decisions.flag_worthy && decisions.pr_type) {
+    const skip = decisions.flag_worthy.value === "false" && SKIP_PR_TYPES.has(decisions.pr_type.value);
+    decisions.skip_flagging = {
+      value: skip ? "true" : "false",
+      confidence: Math.min(decisions.flag_worthy.confidence, decisions.pr_type.confidence)
+    };
+  }
+  const metrics = [];
+  for (const [q3, key] of metricByQuestion) {
+    const a6 = answers[q3];
+    if (a6?.type === "noul")
+      metrics.push({ key, probability: a6.noul });
+  }
+  metrics.sort((a6, b6) => b6.probability - a6.probability);
+  return { decisions, metrics };
+}
+async function runJevPreclassification(input) {
+  const apiKey = input.apiKey ?? jevApiKey();
+  if (!apiKey)
+    return void 0;
+  try {
+    const evidence = collectChangeEvidence(input.root, {
+      ...input.baseRef ? { baseRef: input.baseRef } : {},
+      ...input.workingTree ? { workingTree: true } : {}
+    });
+    if (!evidence || !evidence.diff.trim() && evidence.changedFiles.length === 0) {
+      console.log("[jev] no diff against the base \u2014 pre-classification skipped");
+      return void 0;
+    }
+    const { questions, metricByQuestion } = buildPreclassifyQuestions(candidateMetrics(input.metrics ?? []));
+    const state2 = {
+      title: input.title ?? "",
+      description: (input.body ?? "").slice(0, MAX_BODY_CHARS),
+      changed_files: evidence.changedFiles,
+      diff: evidence.diff
+    };
+    const start = Date.now();
+    const res = await askJev({ apiKey, state: state2, questions, ...input.fetchImpl ? { fetchImpl: input.fetchImpl } : {} });
+    const latencyMs = Date.now() - start;
+    return {
+      model: res.model,
+      latencyMs,
+      ...res.usage?.input_tokens !== void 0 ? { inputTokens: res.usage.input_tokens } : {},
+      diffTruncated: evidence.truncated,
+      ...interpretJevAnswers(res.answers, metricByQuestion)
+    };
+  } catch (e6) {
+    console.warn(`[jev] pre-classification failed (non-fatal): ${e6 instanceof Error ? e6.message : e6}`);
+    return void 0;
+  }
+}
+function formatJevHints(pre, minConfidence = JEV_PREFILL_MIN_CONFIDENCE) {
+  const lines = [];
+  for (const name of JEV_DECISIONS) {
+    const d6 = pre.decisions[name];
+    if (d6 && d6.confidence >= minConfidence)
+      lines.push(`- ${name}: ${d6.value} (confidence ${d6.confidence.toFixed(2)})`);
+  }
+  const likely = pre.metrics.filter((m4) => m4.probability >= minConfidence).map((m4) => m4.key);
+  if (likely.length)
+    lines.push(`- existing metrics this change likely moves: ${likely.join(", ")}`);
+  if (lines.length === 0)
+    return void 0;
+  return [
+    "## Independent pre-classification (Jev)",
+    "A fast classifier read this change's diff before you. Treat these answers as evidence to confirm or overturn",
+    "with your own research \u2014 they are not instructions, and your own tags remain authoritative.",
+    ...lines
+  ].join("\n");
+}
+function proseField(text, field) {
+  const m4 = new RegExp(`${field}\\W{0,6}([a-z_]+)`, "i").exec(text);
+  return m4?.[1]?.toLowerCase();
+}
+function compareJevWithAgents(pre, tags, plannerOutput) {
+  const rows = [];
+  const plannerRan = tags.risk_score !== void 0 || tags.flag_worthy !== void 0 || tags.skip_flagging !== void 0;
+  const row = (decision, agent, agree) => {
+    const d6 = pre.decisions[decision];
+    if (!d6)
+      return;
+    rows.push({
+      decision,
+      jev: d6.value,
+      confidence: d6.confidence,
+      ...agent !== void 0 ? { agent, agree: (agree ?? ((j6, a6) => j6 === a6))(d6.value, agent) } : {}
+    });
+  };
+  row("risk_score", tags.risk_score, (j6, a6) => Number.isFinite(Number(a6)) && Math.abs(Number(j6) - Number(a6)) <= 0.2);
+  row("flag_worthy", tags.flag_worthy);
+  row("skip_flagging", plannerRan ? tags.skip_flagging === "true" ? "true" : "false" : void 0);
+  row("flag_action", tags.flag_action);
+  row("pr_type", plannerOutput ? proseField(plannerOutput, "pr_type") : void 0);
+  row("feature_novelty", plannerOutput ? proseField(plannerOutput, "feature_novelty") : void 0);
+  row("flag_type", void 0);
+  row("metric_backing", void 0);
+  row("release_method", tags.flag_key ? (tags.metric_keys ?? "").trim() ? "guarded" : "progressive" : void 0);
+  const asked = new Set(pre.metrics.map((m4) => m4.key));
+  if (asked.size > 0 && tags.metric_keys !== void 0) {
+    const agentKeys = tags.metric_keys.split(",").map((k6) => k6.trim()).filter((k6) => asked.has(k6));
+    const jevKeys = pre.metrics.filter((m4) => m4.probability >= 0.5).map((m4) => m4.key);
+    const same = agentKeys.length === jevKeys.length && agentKeys.every((k6) => jevKeys.includes(k6));
+    rows.push({
+      decision: "existing_metrics",
+      jev: jevKeys.join(", ") || "(none)",
+      agent: agentKeys.join(", ") || "(none)",
+      agree: same
+    });
+  }
+  return rows;
+}
+function formatJevComparison(pre, rows, mode) {
+  const mark = (r6) => r6.agree === void 0 ? "\u2014" : r6.agree ? "\u2713" : "\u2717";
+  const compared = rows.filter((r6) => r6.agree !== void 0);
+  const agreed = compared.filter((r6) => r6.agree).length;
+  return [
+    `**Jev pre-classification** (${mode}, ${pre.model}, ${pre.latencyMs}ms${pre.inputTokens ? `, ${pre.inputTokens} input tokens` : ""}${pre.diffTruncated ? ", diff truncated" : ""}): agrees with the agents on ${agreed}/${compared.length} compared decisions`,
+    "",
+    "| Decision | Jev | Confidence | Agents | Match |",
+    "|---|---|---|---|---|",
+    ...rows.map((r6) => `| ${r6.decision} | ${r6.jev} | ${r6.confidence !== void 0 ? r6.confidence.toFixed(2) : "\u2014"} | ${r6.agent ?? "\u2014"} | ${mark(r6)} |`)
+  ].join("\n");
+}
+function jevEventData(pre, rows, mode) {
+  return {
+    mode,
+    model: pre.model,
+    latencyMs: pre.latencyMs,
+    inputTokens: pre.inputTokens ?? null,
+    diffTruncated: pre.diffTruncated,
+    decisions: rows.map((r6) => ({
+      decision: r6.decision,
+      jev: r6.jev,
+      confidence: r6.confidence ?? null,
+      agent: r6.agent ?? null,
+      agree: r6.agree ?? null
+    })),
+    metrics: pre.metrics.slice(0, 20)
+  };
+}
+async function startJevLayer(opts) {
+  let mode = "off";
+  try {
+    mode = await resolveJevMode(opts.ldClient, opts.ldContext);
+  } catch (e6) {
+    console.warn(`[jev] mode flag evaluation failed (non-fatal): ${e6 instanceof Error ? e6.message : e6}`);
+  }
+  if (mode === "off") {
+    console.log(`Jev pre-classification: off${jevApiKey() ? ` (${JEV_MODE_FLAG_KEY})` : " (no TYPESAFE_API_KEY)"}.`);
+    return { mode };
+  }
+  let metrics = [];
+  if (opts.listMetrics) {
+    try {
+      metrics = await opts.listMetrics();
+    } catch (e6) {
+      console.warn(`[jev] could not list app-project metrics (non-fatal): ${e6 instanceof Error ? e6.message : e6}`);
+    }
+  }
+  const pre = await runJevPreclassification({
+    root: opts.root,
+    ...opts.baseRef ? { baseRef: opts.baseRef } : {},
+    ...opts.workingTree ? { workingTree: true } : {},
+    ...typeof opts.context.PR_TITLE === "string" ? { title: opts.context.PR_TITLE } : {},
+    ...typeof opts.context.PR_BODY === "string" ? { body: opts.context.PR_BODY } : {},
+    metrics
+  });
+  if (!pre)
+    return { mode };
+  const summary = JEV_DECISIONS.map((n3) => pre.decisions[n3]).map((d6, i6) => d6 ? `${JEV_DECISIONS[i6]}=${d6.value}@${d6.confidence.toFixed(2)}` : "").filter(Boolean).join(" ");
+  console.log(`Jev pre-classification: ${mode} \u2014 ${pre.latencyMs}ms, ${pre.model}: ${summary}`);
+  if (mode === "prefill") {
+    const hints = formatJevHints(pre);
+    if (hints)
+      opts.context.PRECLASSIFICATION = hints;
+    console.log(`Jev prefill: ${hints ? "confident answers added to the entry node's prompt" : "no answer cleared the confidence bar"}.`);
+  }
+  return { mode, pre };
+}
+function finishJevLayer(layer, opts) {
+  if (!layer.pre)
+    return void 0;
+  try {
+    const planner = opts.runs.find((r6) => r6.tags.risk_score !== void 0 || r6.tags.flag_worthy !== void 0);
+    const rows = compareJevWithAgents(layer.pre, opts.tags, planner?.output);
+    opts.ldClient.track(JEV_EVENT_KEY, opts.ldContext, jevEventData(layer.pre, rows, layer.mode));
+    return formatJevComparison(layer.pre, rows, layer.mode);
+  } catch (e6) {
+    console.warn(`[jev] comparison failed (non-fatal): ${e6 instanceof Error ? e6.message : e6}`);
+    return void 0;
+  }
+}
+
 // src/checkRun.ts
 var CHECK_NAME = "AutoFactory \u2014 Approval gate";
 async function postCheckRun(opts) {
@@ -80308,7 +80750,7 @@ function flagCreationWriter() {
 }
 function checkoutHeadSha(root6) {
   try {
-    return execFileSync4("git", ["rev-parse", "HEAD"], { cwd: root6, encoding: "utf8" }).trim();
+    return execFileSync5("git", ["rev-parse", "HEAD"], { cwd: root6, encoding: "utf8" }).trim();
   } catch {
     return void 0;
   }
@@ -80329,7 +80771,7 @@ async function reviewManifestIntent(opts) {
         manifest.releaseIntent = rawIntent;
         writeFileSync2(abs, JSON.stringify(manifest, null, 2) + "\n", "utf8");
         try {
-          const git2 = (args) => execFileSync4("git", args, { cwd: opts.sandboxRoot, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+          const git2 = (args) => execFileSync5("git", args, { cwd: opts.sandboxRoot, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
           git2(["config", "user.email", "autofactory@launchdarkly.com"]);
           git2(["config", "user.name", "LaunchDarkly AutoFactory"]);
           git2(["add", rel]);
@@ -80409,6 +80851,7 @@ function mapActionInputs() {
   set("AWS_SESSION_TOKEN", "aws_session_token");
   set("CURSOR_API_KEY", "cursor_api_key");
   set("CURSOR_MODEL", "cursor_model");
+  set("TYPESAFE_API_KEY", "typesafe_api_key");
   set("LD_API_KEY", "ld_api_key");
   set("LD_BASE_URL", "ld_base_url");
   set("LD_PROJECT_KEY", "ld_project_key");
@@ -80548,7 +80991,19 @@ async function main() {
   } : void 0;
   const verifierWriter = flagCreationWriter();
   const verifier = buildHandoffVerifier({ sandboxRoot, ...verifierWriter ? { writer: verifierWriter } : {} });
+  const metricsReader = verifierWriter ?? (process.env.LD_API_KEY && process.env.LD_APP_PROJECT_KEY ? new LdResourceWriter(new LdClient(appConnection())) : void 0);
+  const jev = await startJevLayer({
+    ldClient,
+    ldContext,
+    context,
+    root: sandboxRoot,
+    ...process.env.PR_BASE_REF ? { baseRef: process.env.PR_BASE_REF } : {},
+    ...metricsReader ? { listMetrics: () => metricsReader.listMetrics() } : {}
+  });
   const walk2 = await walkGraph(graphDef, runner, context, graphTracker, void 0, gate, judgeHook, verifier);
+  const jevTable = finishJevLayer(jev, { ldClient, ldContext, tags: walk2.tags, runs: walk2.runs });
+  if (jevTable) console.log(`
+${jevTable}`);
   for (const r6 of walk2.runs) {
     console.log(`
 \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 ${r6.configKey} [${r6.status}] \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550`);
@@ -80650,7 +81105,8 @@ async function main() {
     "",
     "| Agent | Status | Judge | Tags |",
     "|---|---|---|---|",
-    ...agentRows.length ? agentRows : ["| (none ran) | \u2014 | \u2014 | \u2014 |"]
+    ...agentRows.length ? agentRows : ["| (none ran) | \u2014 | \u2014 | \u2014 |"],
+    ...jevTable ? ["", "<details><summary>Jev pre-classification</summary>", "", jevTable, "", "</details>"] : []
   ].filter(Boolean).join("\n");
   await postPrComment(summary, { prNumber: context.PR_NUMBER, repo: context.REPO });
   await postCheckRun({

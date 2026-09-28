@@ -61,3 +61,5 @@ export * from "./graph/index.js";
 // Cross-repo research for split-repo estates (query_related_repos).
 export * from "./github/relatedRepos.js";
 export * from "./github/intake.js";
+// Jev (TypeSafe AI) pre-classification: optional, on with TYPESAFE_API_KEY.
+export * from "./jev/index.js";

@@ -170,7 +170,9 @@ function buildPrompt(hasInbound: boolean, ctx: Record<string, unknown>): string 
     .filter(Boolean)
     .join("\n");
   if (!hasInbound) {
-    return `${header}${ctx.PR_BODY ? `\n\n${ctx.PR_BODY}` : ""}`.trim();
+    // PRECLASSIFICATION: the Jev prefill block (jev/preclassify.ts), entry node only.
+    const pre = typeof ctx.PRECLASSIFICATION === "string" ? `\n\n${ctx.PRECLASSIFICATION}` : "";
+    return `${header}${ctx.PR_BODY ? `\n\n${ctx.PR_BODY}` : ""}${pre}`.trim();
   }
   const brief = typeof ctx.PREVIOUS_STEP_OUTPUT === "string" ? ctx.PREVIOUS_STEP_OUTPUT : "";
   return `${header}\n\n${brief}`.trim();

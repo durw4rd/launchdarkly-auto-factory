@@ -40,6 +40,9 @@ inputs:
   cursor_model:
     description: "Fallback Cursor model id (e.g. 'auto', 'composer-2.5') used only when the LD AI config's model has no match in Cursor's catalog. The configured model is otherwise derived from LaunchDarkly."
     required: false
+  typesafe_api_key:
+    description: "Optional TypeSafe AI (Jev) key. When set, the chain is pre-classified by Jev before the agents run; the auto-factory-jev-mode flag picks shadow (log + compare, default) or prefill (confident answers go into the planner's prompt)."
+    required: false
   # --- App / data-plane project (where flags get created) ---
   ld_app_project_key:
     description: "LaunchDarkly project key where agents create flags (passed to agents as LAUNCHDARKLY_PROJECT)."

@@ -44,6 +44,7 @@ import {
   createPolicyGate,
   decideApproval,
   extractConfigStamp,
+  finishJevLayer,
   getLdSdk,
   intentTicketId,
   interpretWalk,
@@ -55,6 +56,7 @@ import {
   pipelineContext,
   resolveAiProvider,
   resolveApprovalPolicy,
+  startJevLayer,
   targetConnection,
   walkGraph,
   withProvider,
@@ -371,6 +373,7 @@ function mapActionInputs(): void {
   set("AWS_SESSION_TOKEN", "aws_session_token");
   set("CURSOR_API_KEY", "cursor_api_key");
   set("CURSOR_MODEL", "cursor_model");
+  set("TYPESAFE_API_KEY", "typesafe_api_key");
   set("LD_API_KEY", "ld_api_key");
   set("LD_BASE_URL", "ld_base_url");
   set("LD_PROJECT_KEY", "ld_project_key");
@@ -579,7 +582,24 @@ async function main(): Promise<void> {
   const verifierWriter = flagCreationWriter();
   const verifier = buildHandoffVerifier({ sandboxRoot, ...(verifierWriter ? { writer: verifierWriter } : {}) });
 
+  // Jev pre-classification (optional; on with TYPESAFE_API_KEY, mode from the
+  // auto-factory-jev-mode flag). Metrics are read from the app project when an
+  // API key is available, whether or not flag creation is enabled.
+  const metricsReader =
+    verifierWriter ??
+    (process.env.LD_API_KEY && process.env.LD_APP_PROJECT_KEY ? new LdResourceWriter(new LdClient(appConnection())) : undefined);
+  const jev = await startJevLayer({
+    ldClient,
+    ldContext,
+    context,
+    root: sandboxRoot,
+    ...(process.env.PR_BASE_REF ? { baseRef: process.env.PR_BASE_REF } : {}),
+    ...(metricsReader ? { listMetrics: () => metricsReader.listMetrics() } : {}),
+  });
+
   const walk = await walkGraph(graphDef, runner, context, graphTracker, undefined, gate, judgeHook, verifier);
+  const jevTable = finishJevLayer(jev, { ldClient, ldContext, tags: walk.tags, runs: walk.runs });
+  if (jevTable) console.log(`\n${jevTable}`);
 
   // Per-node visibility: dump each agent's terminal status, routing tags, and final output.
   for (const r of walk.runs) {
@@ -730,6 +750,7 @@ async function main(): Promise<void> {
     "| Agent | Status | Judge | Tags |",
     "|---|---|---|---|",
     ...(agentRows.length ? agentRows : ["| (none ran) | — | — | — |"]),
+    ...(jevTable ? ["", "<details><summary>Jev pre-classification</summary>", "", jevTable, "", "</details>"] : []),
   ]
     .filter(Boolean)
     .join("\n");

@@ -78,6 +78,8 @@ jobs:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           ld_app_project_key: ${{ vars.LD_APP_PROJECT_KEY }}   # e.g. autofactory-demo
           ld_api_key: ${{ secrets.LD_API_KEY }}
+          # Optional: Jev pre-classification (auto-factory-jev-mode flag; shadow by default).
+          typesafe_api_key: ${{ secrets.TYPESAFE_API_KEY }}
           enable_flag_creation: "true"   # create real flags/metrics in the app project
           enable_code_changes: "true"    # commit wiring + tests to the PR branch
           pr_branch: ${{ github.event.pull_request.head.ref }}

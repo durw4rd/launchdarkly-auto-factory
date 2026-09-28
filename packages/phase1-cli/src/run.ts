@@ -46,6 +46,7 @@ import {
   createWorkingTreeEvidence,
   decideApproval,
   extractConfigStamp,
+  finishJevLayer,
   getLdSdk,
   hasChangeToProcess,
   initFactorySentry,
@@ -60,6 +61,7 @@ import {
   resolveAiProvider,
   resolveApprovalPolicy,
   resolveMaintainerId,
+  startJevLayer,
   targetConnection,
   walkGraph,
   withProvider,
@@ -377,6 +379,22 @@ async function run(opts: CliOptions): Promise<number> {
   // code-side checks.
   const verifier = buildHandoffVerifier({ sandboxRoot: root, ...(writer ? { writer } : {}) });
 
+  // Jev pre-classification (optional; on with TYPESAFE_API_KEY, mode from the
+  // auto-factory-jev-mode flag). Metrics come from the app project when an API
+  // key is available — read-only, so dry runs get them too.
+  const metricsReader =
+    writer ??
+    (process.env.LD_API_KEY && process.env.LD_APP_PROJECT_KEY ? new LdResourceWriter(new LdClient(appConnection())) : undefined);
+  const jev = await startJevLayer({
+    ldClient,
+    ldContext,
+    context,
+    root,
+    ...(state.resolvedBase ? { baseRef: state.resolvedBase } : {}),
+    workingTree: true,
+    ...(metricsReader ? { listMetrics: () => metricsReader.listMetrics() } : {}),
+  });
+
   const walk = await walkGraph(
     graphDef,
     runner,
@@ -407,6 +425,9 @@ async function run(opts: CliOptions): Promise<number> {
 
   console.log(`\nRan ${walk.runs.length} node(s): ${walk.runs.map((r) => r.configKey).join(" → ")}`);
   if (walk.skipped.length) console.log(`Skipped: ${walk.skipped.join(", ")}`);
+
+  const jevTable = finishJevLayer(jev, { ldClient, ldContext, tags: walk.tags, runs: walk.runs });
+  if (jevTable) console.log(`\n${jevTable}`);
 
   // Halted at an approval gate: the gated step (and everything downstream) did
   // NOT run — nothing was created for it. Tell the caller exactly how to

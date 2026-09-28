@@ -15,6 +15,24 @@ Status legend: ✅ done · 🔜 planned/in progress
 
 ---
 
+## 2026-09-28 (Jev pre-classification, optional layer)
+
+### 🔜 New operational flag `auto-factory-jev-mode` (off / shadow / prefill)
+- Controls the optional Jev (TypeSafe AI) pre-classifier. It only takes effect when
+  `TYPESAFE_API_KEY` is set; with a key and no flag provisioned yet, runs default to
+  **shadow**.
+- Before the chain runs, one Jev request answers: risk_score, flag_worthy,
+  pr_type (→ skip_flagging), flag_type, flag_action, feature_novelty,
+  metric_backing, release_method, plus one yes/no per existing app-project metric.
+- **shadow**: after the walk, the answers are compared with the agents' tags and the
+  planner's prose, printed as a table (CLI summary, collapsed in the PR comment), and
+  emitted as the `autofactory-jev-preclassification` custom event.
+- **prefill**: shadow, plus answers with confidence ≥ 0.7 go into the entry node's
+  prompt as evidence. Tags are never seeded, so routing and approval gates are
+  unchanged in every mode.
+- No AI config or graph changes. Status 🔜 until `bridge upgrade` creates the flag in
+  the live project.
+
 ## 2026-09-04 (issue intake entry point — ADR 0019)
 
 ### ✅ New AI config `autofactory-issue-coder` (step 0, intake)
