@@ -84,7 +84,7 @@ past the gate with `--approve <nodeKey>`.
 
 - **Codex runs execute on OpenAI models by default** (ADR 0018): the
   `auto-factory-ai-provider` flag routes the `codex` surface to the OpenAI
-  runner (`gpt-5.2` agents, `gpt-5-mini` judges), billed to
+  runner (`gpt-5.5` agents, `gpt-5.4-mini` judges), billed to
   `OPENAI_API_KEY`/`CODEX_API_KEY` in the tooling repo's `.env` — separate
   from your ChatGPT/Codex subscription. Retarget the flag in LaunchDarkly to
   run the same chain on Anthropic/Bedrock instead. The CLI only ever runs the

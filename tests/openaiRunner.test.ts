@@ -32,8 +32,8 @@ describe("openaiModelId", () => {
 
   it("passes unprefixed ids through and defaults when absent", () => {
     assert.equal(openaiModelId("gpt-5.2"), "gpt-5.2");
-    assert.equal(openaiModelId(undefined), "gpt-5.2");
-    assert.equal(openaiModelId("  "), "gpt-5.2");
+    assert.equal(openaiModelId(undefined), "gpt-5.5");
+    assert.equal(openaiModelId("  "), "gpt-5.5");
   });
 });
 

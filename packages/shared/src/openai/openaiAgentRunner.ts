@@ -30,7 +30,7 @@ import {
 } from "../anthropic/anthropicAgentRunner.js";
 import { SandboxToolExecutor, type ToolCapabilities, applyLdToolOverlay, buildSandboxTools } from "../anthropic/sandboxTools.js";
 
-const DEFAULT_MODEL = "gpt-5.2";
+const DEFAULT_MODEL = "gpt-5.5";
 const DEFAULT_BASE_URL = "https://api.openai.com/v1";
 // Backstops matching the Anthropic runner's sizing rationale (not budgets).
 const DEFAULT_MAX_TURNS = 100;

@@ -15,6 +15,51 @@ Status legend: ✅ done · 🔜 planned/in progress
 
 ---
 
+## 2026-09-30 (model refresh)
+
+### ✅ Every live variation moved to current models; targeting untouched
+- Audited all AI configs in `auto-factory-prototype` against what each provider
+  offers today (Anthropic `/v1/models`, OpenAI `/v1/models`, the Cursor catalog,
+  and LD's model registry). Updated each variation in place (`modelConfigKey` +
+  name), so rules, rollouts, and variation ids stay the same. An SDK sweep over
+  anthropic / cursor / openai / no-provider contexts shows the same routing as
+  before; only the models changed.
+
+  | Variation | Before | After |
+  |---|---|---|
+  | agent `default` (planner, implementer, metrics-author, testing, reviewer, issue-coder, steward, plus diagram-agent and pr-risk-assessor) and metrics-author `sentry` | Sonnet 4.6 (Sonnet 4.5 on diagram-agent / pr-risk-assessor) | **Opus 5.5**, `effort: high` |
+  | judge `default` (both judges) | Sonnet 4.6 | **Sonnet 5.5** |
+  | `fable-5` arm (implementer, metrics-author; 50/50 with `default` on `provider=anthropic`) | Fable 5 | **Fable 5.1** (key unchanged) |
+  | `openai` (6 agents) | gpt-5.2 | **gpt-5.5** |
+  | `openai` (2 judges) | gpt-5-mini | **gpt-5.4-mini** |
+  | flag-testing `composer-2-5` | custom `composer-2-5-composer-2.5` | built-in `Cursor.composer-2.5` (same model; the custom key only resolved through fuzzy matching) |
+  | implementer `release-manifest` (Bedrock) | Bedrock Sonnet 4.6 | Bedrock Opus 5.5 |
+  | `hello-test` scaffolds | Sonnet 4.5 | Sonnet 5.5 |
+
+- `effort: high` is set explicitly on the Opus 5.5 agents. Opus 5.5 defaults to
+  `medium`, while Sonnet 4.6 ran at the equivalent of `high`. The Anthropic
+  runner now reads `effort` from the variation's model parameters (it previously
+  ignored all LD model parameters), so effort can be tuned or A/B-tested in LD.
+- Left alone on purpose:
+  - Composer 2.5 is still Cursor's newest model.
+  - The Vega variations stay on Sonnet 4.5. Vega picks its model server-side, and
+    we can't verify which newer models it accepts.
+  - Jev (TypeSafe) is unchanged.
+- **Not GPT-5.6:** GPT-5.6 Sol/Terra/Luna reject function tools combined with
+  reasoning on `/v1/chat/completions`, which is the endpoint the OpenAI runner
+  uses, so gpt-5.5 is the newest usable OpenAI model. Moving to 5.6 needs the
+  runner ported to the Responses API.
+- **Code change required first:** Opus 5.5, Sonnet 5.5, and Fable 5.1 return a
+  400 on forced `tool_choice` (checked live). That would have broken every
+  Anthropic judge call and the runner's forced `tag_conversation` backstop. Both
+  now fall back to `tool_choice: auto` plus an explicit instruction on those
+  models (the judge gets one nudge if it answers in text). Older models still
+  use forced tool choice.
+- The committed seeds (`ai-configs/*.json`) and the code fallbacks
+  (`claude-opus-5-5`, `gpt-5.5`) now match the live configs.
+
+---
+
 ## 2026-09-28 (Jev pre-classification, optional layer)
 
 ### ✅ `autofactory-jev-preclassifier/default`: flag questions are mechanical, not judgment calls

@@ -2,12 +2,19 @@
  * Anthropic implementation of the judge completion: a single structured
  * completion for the SDK Judge class. Structured output is obtained with a
  * FORCED tool call whose input schema is the judge's evaluation schema
- * ({score, reasoning}) — no free-text JSON parsing needed.
+ * ({score, reasoning}) — no free-text JSON parsing needed. Models that reject
+ * forced tool use (Opus 5.5 / Sonnet 5.5 / Fable 5.1+) get `auto` plus an
+ * explicit instruction, and one nudge if they answer in text instead.
  */
 
 import Anthropic from "@anthropic-ai/sdk";
 import type { JudgeCompletion } from "../judges.js";
-import { ANTHROPIC_TIMEOUT_MS, type AnthropicMessagesClient, anthropicModelId } from "./anthropicAgentRunner.js";
+import {
+  ANTHROPIC_TIMEOUT_MS,
+  type AnthropicMessagesClient,
+  anthropicModelId,
+  supportsForcedToolChoice,
+} from "./anthropicAgentRunner.js";
 
 // Backstop, not a budget: the output is one {score, reasoning} tool call, but
 // the reasoning is written against a large evidence diff. At 1024 a verbose
@@ -35,11 +42,13 @@ export function createForcedToolJudgeCompletion(
   modelId: (name: string | undefined) => string,
 ): JudgeCompletion {
   return async (req) => {
-    const resp = await client.messages.create({
-      model: modelId(req.model),
+    const model = modelId(req.model);
+    const forced = supportsForcedToolChoice(model);
+    const messages: Anthropic.MessageParam[] = [{ role: "user", content: req.input }];
+    const params = {
+      model,
       max_tokens: MAX_TOKENS,
-      system: req.system,
-      messages: [{ role: "user", content: req.input }],
+      system: forced ? req.system : `${req.system}\n\nRecord your result by calling the \`record_evaluation\` tool.`,
       tools: [
         {
           name: "record_evaluation",
@@ -47,8 +56,20 @@ export function createForcedToolJudgeCompletion(
           input_schema: req.schema as Anthropic.Tool["input_schema"],
         },
       ],
-      tool_choice: { type: "tool", name: "record_evaluation" },
-    });
+      tool_choice: forced ? ({ type: "tool", name: "record_evaluation" } as const) : ({ type: "auto" } as const),
+    };
+    let resp = await client.messages.create({ ...params, messages });
+    let inputTokens = resp.usage.input_tokens;
+    let outputTokens = resp.usage.output_tokens;
+    if (!forced && resp.stop_reason === "end_turn" && !resp.content.some((b) => b.type === "tool_use")) {
+      messages.push(
+        { role: "assistant", content: resp.content },
+        { role: "user", content: "Call `record_evaluation` now with your score and reasoning." },
+      );
+      resp = await client.messages.create({ ...params, messages });
+      inputTokens += resp.usage.input_tokens;
+      outputTokens += resp.usage.output_tokens;
+    }
     const toolUse = resp.content.find((b): b is Anthropic.ToolUseBlock => b.type === "tool_use");
     // A max_tokens stop truncates the tool input — whatever partially parsed is
     // NOT a trustworthy evaluation. Fail explicitly instead of letting the
@@ -65,9 +86,9 @@ export function createForcedToolJudgeCompletion(
         : JSON.stringify(toolUse?.input ?? null),
       success: ok,
       tokens: {
-        input: resp.usage.input_tokens,
-        output: resp.usage.output_tokens,
-        total: resp.usage.input_tokens + resp.usage.output_tokens,
+        input: inputTokens,
+        output: outputTokens,
+        total: inputTokens + outputTokens,
       },
     };
   };
