@@ -211,22 +211,17 @@ async function intake(opts: IntakeOptions): Promise<number> {
         ? new OpenAiAgentRunner(runnerOpts)
         : new AnthropicAgentRunner({ ...runnerOpts, ...(process.env.ANTHROPIC_API_KEY ? { apiKey: process.env.ANTHROPIC_API_KEY } : {}) });
 
-  const walk = await walkGraph(
-    graphDef,
-    runner,
-    context,
+  const walk = await walkGraph(graphDef, runner, context, {
     graphTracker,
-    (event) => {
+    onEvent: (event) => {
       if (event.type === "node-start") console.log(`\n▶ ${nodeTitle(event.configKey)}`);
       else if (event.type === "node-complete") {
         console.log(`■ done: ${nodeTitle(event.run.configKey)} [${event.run.status}] tags: ${JSON.stringify(event.run.tags)}`);
       } else if (event.type === "stalled") console.log(`⚠ ${describeStall(event.stall)}`);
     },
-    undefined,
-    undefined,
-    undefined,
-    { startAt: opts.node, stopAfter: [opts.node] },
-  );
+    startAt: opts.node,
+    stopAfter: [opts.node],
+  });
 
   const run = walk.runs[0];
   const lines: string[] = ["", "──────── AutoFactory intake — summary ────────", `Issue: ${issue.htmlUrl}`, `Intent: ${intent}; run ${runId}`];

@@ -89,11 +89,6 @@ describe("intake entry point (ADR 0019): graph entry selection", () => {
       graph(true),
       runner,
       { REPO: "o/r", ISSUE_NUMBER: "12", PR_TITLE: "Add sort", PR_BODY: "body", PR_BRANCH: "autofactory/issue-12" },
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
       { startAt: CODER, stopAfter: [CODER] },
     );
     assert.deepEqual(w.runs.map((r) => r.configKey), [CODER]);
@@ -106,7 +101,7 @@ describe("intake entry point (ADR 0019): graph entry selection", () => {
 
   it("startAt on an unknown node throws", async () => {
     await assert.rejects(
-      walkGraph(graph(true), new RecordingRunner(), {}, undefined, undefined, undefined, undefined, undefined, { startAt: "nope" }),
+      walkGraph(graph(true), new RecordingRunner(), {}, { startAt: "nope" }),
       /start node 'nope'/,
     );
   });
