@@ -78109,7 +78109,7 @@ function modeNote(caps) {
 var DEFAULT_MAX_TURNS = 100;
 var MAX_TOKENS = 32e3;
 var ANTHROPIC_TIMEOUT_MS = 36e5;
-var DEFAULT_MODEL = "claude-sonnet-4-6";
+var DEFAULT_MODEL = "claude-opus-5-5";
 var TRANSIENT_RETRIES = 3;
 var TRANSIENT_BACKOFF_MS = [5e3, 15e3, 45e3];
 function isTransientApiError(e6) {
@@ -78242,7 +78242,8 @@ var AnthropicAgentRunner = class {
     console.log(`[node] ${req.configKey} grant(${source}): createFlag=${grant.createFlag} flagState=${grant.flagState === true} createMetric=${grant.createMetric} editFiles=${grant.editFiles} readDocs=${grant.readDocs === true} queryGraph=${grant.queryGraph === true} querySentry=${grant.querySentry === true} queryRepos=${grant.queryRepos === true} \u2192 effective createFlag=${caps.createFlag} flagState=${caps.flagState === true} createMetric=${caps.createMetric} editFiles=${caps.editFiles} readDocs=${caps.readDocs === true} queryGraph=${caps.queryGraph === true} querySentry=${caps.querySentry === true} queryRepos=${caps.queryRepos === true}`);
     const writer = caps.createFlag || caps.createMetric || caps.flagState ? this.opts.writer : void 0;
     const model = this.modelId(req.model);
-    console.log(`[node] ${req.configKey} ${this.providerName} model \u2192 '${model}'${req.model && req.model !== model ? ` (LD: '${req.model}')` : ""}`);
+    const outputConfig = effortConfig(req.modelParameters);
+    console.log(`[node] ${req.configKey} ${this.providerName} model \u2192 '${model}'${req.model && req.model !== model ? ` (LD: '${req.model}')` : ""}${outputConfig ? ` effort=${outputConfig.effort}` : ""}`);
     const executor = new SandboxToolExecutor(this.opts.sandboxRoot, writer, caps.editFiles, this.opts.prBranch, this.opts.prBaseRef, this.opts.gitMode ?? "push", caps.writeManifest === true && this.opts.codeChangesEnabled === true, caps.stewardManifest === true && this.opts.codeChangesEnabled === true, this.opts.skipCi ?? true);
     if (caps.queryGraph && this.opts.knowledgeGraph) {
       executor.provideKnowledgeGraph(this.opts.knowledgeGraph, this.opts.changedFiles ?? []);
@@ -78273,7 +78274,8 @@ var AnthropicAgentRunner = class {
           max_tokens: MAX_TOKENS,
           system,
           tools,
-          messages
+          messages,
+          ...outputConfig ? { output_config: outputConfig } : {}
         });
         inputTokens += resp.usage.input_tokens;
         outputTokens += resp.usage.output_tokens;
@@ -78308,7 +78310,10 @@ var AnthropicAgentRunner = class {
             system,
             tools,
             messages,
-            tool_choice: { type: "tool", name: "tag_conversation" }
+            ...outputConfig ? { output_config: outputConfig } : {},
+            // The prompt above names the tool, so `auto` still steers it on
+            // models that reject forced tool use.
+            tool_choice: supportsForcedToolChoice(model) ? { type: "tool", name: "tag_conversation" } : { type: "auto" }
           });
           inputTokens += forced.usage.input_tokens;
           outputTokens += forced.usage.output_tokens;
@@ -78358,6 +78363,19 @@ var AnthropicAgentRunner = class {
 };
 function textOf(content) {
   return content.filter((b6) => b6.type === "text").map((b6) => b6.text).join("\n").trim();
+}
+var EFFORT_LEVELS = /* @__PURE__ */ new Set(["low", "medium", "high", "xhigh", "max"]);
+function effortConfig(params) {
+  const effort = params?.effort;
+  return typeof effort === "string" && EFFORT_LEVELS.has(effort) ? { effort } : void 0;
+}
+function supportsForcedToolChoice(model) {
+  const m4 = /claude-(opus|sonnet|haiku|fable|mythos)-(\d+)(?:-(\d{1,2}))?(?!\d)/i.exec(model);
+  if (!m4)
+    return true;
+  const version = Number(m4[2]) + Number(m4[3] ?? 0) / 10;
+  const family = m4[1].toLowerCase();
+  return family === "fable" || family === "mythos" ? version < 5.1 : version < 5.5;
 }
 function anthropicModelId(name) {
   if (!name)
@@ -79228,7 +79246,7 @@ var BedrockAgentRunner = class {
 };
 
 // ../shared/dist/openai/openaiAgentRunner.js
-var DEFAULT_MODEL2 = "gpt-5.2";
+var DEFAULT_MODEL2 = "gpt-5.5";
 var DEFAULT_BASE_URL = "https://api.openai.com/v1";
 var DEFAULT_MAX_TURNS2 = 100;
 var MAX_COMPLETION_TOKENS = 32e3;
@@ -79859,11 +79877,15 @@ function createAnthropicJudgeCompletion(apiKey) {
 }
 function createForcedToolJudgeCompletion(client, modelId) {
   return async (req) => {
-    const resp = await client.messages.create({
-      model: modelId(req.model),
+    const model = modelId(req.model);
+    const forced = supportsForcedToolChoice(model);
+    const messages = [{ role: "user", content: req.input }];
+    const params = {
+      model,
       max_tokens: MAX_TOKENS2,
-      system: req.system,
-      messages: [{ role: "user", content: req.input }],
+      system: forced ? req.system : `${req.system}
+
+Record your result by calling the \`record_evaluation\` tool.`,
       tools: [
         {
           name: "record_evaluation",
@@ -79871,8 +79893,17 @@ function createForcedToolJudgeCompletion(client, modelId) {
           input_schema: req.schema
         }
       ],
-      tool_choice: { type: "tool", name: "record_evaluation" }
-    });
+      tool_choice: forced ? { type: "tool", name: "record_evaluation" } : { type: "auto" }
+    };
+    let resp = await client.messages.create({ ...params, messages });
+    let inputTokens = resp.usage.input_tokens;
+    let outputTokens = resp.usage.output_tokens;
+    if (!forced && resp.stop_reason === "end_turn" && !resp.content.some((b6) => b6.type === "tool_use")) {
+      messages.push({ role: "assistant", content: resp.content }, { role: "user", content: "Call `record_evaluation` now with your score and reasoning." });
+      resp = await client.messages.create({ ...params, messages });
+      inputTokens += resp.usage.input_tokens;
+      outputTokens += resp.usage.output_tokens;
+    }
     const toolUse = resp.content.find((b6) => b6.type === "tool_use");
     const truncated = resp.stop_reason === "max_tokens";
     if (truncated) {
@@ -79884,9 +79915,9 @@ function createForcedToolJudgeCompletion(client, modelId) {
       content: truncated ? `judge output truncated at max_tokens=${MAX_TOKENS2}; partial: ${JSON.stringify(toolUse?.input ?? null)}` : JSON.stringify(toolUse?.input ?? null),
       success: ok,
       tokens: {
-        input: resp.usage.input_tokens,
-        output: resp.usage.output_tokens,
-        total: resp.usage.input_tokens + resp.usage.output_tokens
+        input: inputTokens,
+        output: outputTokens,
+        total: inputTokens + outputTokens
       }
     };
   };
@@ -80153,12 +80184,15 @@ var DEFAULT_JEV_QUESTIONS = {
     instructions: "How risky is this change to ship? Score the blast radius of the behavior change, not the line count. Any change to what a customer is charged or shown as a price is at least Moderate.",
     criteria: RISK_LEVELS
   },
+  // Mechanical, not a judgment call: "can this be gated and isn't yet", never
+  // "is gating worthwhile" — that takes business context Jev doesn't have. The
+  // pipeline's policy is to flag nearly everything that can be flagged.
   flag_worthy: {
     type: "noul",
-    instructions: "Should this change be released behind a feature flag?",
+    instructions: "Can the behavior this change introduces or modifies be gated at runtime with a LaunchDarkly feature flag, where it is not already gated? Do not judge whether gating is worthwhile \u2014 only whether it is technically possible and not yet done.",
     criteria: {
-      true: "It changes user-facing behavior, business logic, an API, or an endpoint, so it should be gated and released progressively",
-      false: "It has no user-facing behavior change (docs, tests, dependencies, config, infrastructure, pure refactor)"
+      true: "Yes: the change alters code that runs in production (UI, API endpoints, business logic, runtime configuration reads) and no existing flag evaluation already wraps that changed code",
+      false: "No: nothing gateable changed (only docs, comments, tests, CI/build files, or dependency manifests), or every changed runtime path is already wrapped by an existing flag evaluation"
     }
   },
   pr_type: {
@@ -80187,13 +80221,13 @@ var DEFAULT_JEV_QUESTIONS = {
   },
   flag_action: {
     type: "choice",
-    instructions: "Which flag action fits this change? Look for existing flag evaluations around the changed code in the diff.",
+    instructions: "Which flag action fits this change? Decide mechanically from the diff: look for existing flag evaluations around the changed code. Do not judge whether a flag is worthwhile.",
     criteria: {
-      create: "Flag-worthy, and no existing flag gates the touched code: create a fresh flag",
-      ride_existing: "An existing flag gates this code and the change iterates on the flagged, not-yet-released variation",
-      extend_variation: "An existing multivariate flag gates this code, its variation is already released, and this is an iteration: add the next variation",
-      child_flag: "Net-new functionality inside or next to already-flagged code: create a new flag with the existing one as a prerequisite",
-      none: "Not flag-worthy at all"
+      create: "The change alters runtime behavior and no existing flag evaluation wraps the changed code: create a fresh flag",
+      ride_existing: "An existing flag evaluation wraps the changed code and the change iterates on that flagged path",
+      extend_variation: "An existing multivariate flag wraps the changed code and the change adds a new alternative to it: add the next variation",
+      child_flag: "The change adds new functionality inside or next to code already wrapped by a flag: create a new flag with the existing one as a prerequisite",
+      none: "Nothing in the change runs at runtime (only docs, comments, tests, CI/build files, or dependency manifests)"
     }
   },
   feature_novelty: {

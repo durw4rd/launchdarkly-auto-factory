@@ -114,7 +114,7 @@ const MAX_TOKENS = 32_000;
  * requires setting this. 60 min matches the SDK's own non-streaming ceiling.
  */
 export const ANTHROPIC_TIMEOUT_MS = 3_600_000;
-const DEFAULT_MODEL = "claude-sonnet-4-6";
+const DEFAULT_MODEL = "claude-opus-5-5";
 
 /**
  * Per-turn retries on TRANSIENT API errors, on top of the SDK's own built-in
@@ -373,9 +373,14 @@ export class AnthropicAgentRunner implements AgentRunner {
     const writer = caps.createFlag || caps.createMetric || caps.flagState ? this.opts.writer : undefined;
 
     const model = this.modelId(req.model);
+    const outputConfig = effortConfig(req.modelParameters);
     // Parity with the Cursor runner's model log: the served variation's model is
     // what makes A/B run logs attributable without querying LD monitoring.
-    console.log(`[node] ${req.configKey} ${this.providerName} model → '${model}'${req.model && req.model !== model ? ` (LD: '${req.model}')` : ""}`);
+    console.log(
+      `[node] ${req.configKey} ${this.providerName} model → '${model}'${req.model && req.model !== model ? ` (LD: '${req.model}')` : ""}${
+        outputConfig ? ` effort=${outputConfig.effort}` : ""
+      }`,
+    );
     const executor = new SandboxToolExecutor(
       this.opts.sandboxRoot,
       writer,
@@ -431,6 +436,7 @@ export class AnthropicAgentRunner implements AgentRunner {
           system,
           tools,
           messages,
+          ...(outputConfig ? { output_config: outputConfig } : {}),
         });
         inputTokens += resp.usage.input_tokens;
         outputTokens += resp.usage.output_tokens;
@@ -474,7 +480,10 @@ export class AnthropicAgentRunner implements AgentRunner {
             system,
             tools,
             messages,
-            tool_choice: { type: "tool", name: "tag_conversation" },
+            ...(outputConfig ? { output_config: outputConfig } : {}),
+            // The prompt above names the tool, so `auto` still steers it on
+            // models that reject forced tool use.
+            tool_choice: supportsForcedToolChoice(model) ? { type: "tool", name: "tag_conversation" } : { type: "auto" },
           });
           inputTokens += forced.usage.input_tokens;
           outputTokens += forced.usage.output_tokens;
@@ -548,6 +557,34 @@ function textOf(content: Anthropic.ContentBlock[]): string {
  * optional leading region segment and a single "anthropic." prefix; everything
  * else (including multi-dot model ids like "...-v1:0") passes through unchanged.
  */
+const EFFORT_LEVELS = new Set(["low", "medium", "high", "xhigh", "max"]);
+
+/**
+ * `output_config.effort` from the LD variation's model parameters (`effort`:
+ * low | medium | high | xhigh | max). Unset or unrecognized → undefined, so the
+ * model's own default applies (Opus 5.5 defaults to medium, others to high).
+ */
+export function effortConfig(params: Record<string, unknown> | undefined): Anthropic.OutputConfig | undefined {
+  const effort = params?.effort;
+  return typeof effort === "string" && EFFORT_LEVELS.has(effort)
+    ? { effort: effort as NonNullable<Anthropic.OutputConfig["effort"]> }
+    : undefined;
+}
+
+/**
+ * Whether the model accepts FORCED tool use (`tool_choice` `tool`/`any`). Claude
+ * Opus 5.5, Sonnet 5.5, and Fable/Mythos 5.1 (and later) reject it with a 400;
+ * callers fall back to `auto` and steer from the prompt. Works on bare,
+ * provider-qualified, and Bedrock ids; unrecognized ids are assumed to accept it.
+ */
+export function supportsForcedToolChoice(model: string): boolean {
+  const m = /claude-(opus|sonnet|haiku|fable|mythos)-(\d+)(?:-(\d{1,2}))?(?!\d)/i.exec(model);
+  if (!m) return true;
+  const version = Number(m[2]) + Number(m[3] ?? 0) / 10;
+  const family = m[1]!.toLowerCase();
+  return family === "fable" || family === "mythos" ? version < 5.1 : version < 5.5;
+}
+
 export function anthropicModelId(name: string | undefined): string {
   if (!name) return DEFAULT_MODEL;
   const id = name

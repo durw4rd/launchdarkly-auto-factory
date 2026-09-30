@@ -24,7 +24,7 @@ canonical public copies of the six chain agents plus the optional intake entry p
 | `autofactory-code-reviewer.json` | 6 | independent verdict + risk level |
 
 Only the `default` variation (the Anthropic tool-use surface, on
-`claude-sonnet-4-6`) is committed. The live prototype project also carries
+`claude-opus-5-5`, effort `high`) is committed. The live prototype project also carries
 per-provider/per-model variations (e.g. a Vega runtime variant, and a Composer
 variation on the coding agents for the Cursor A/B); those are not committed here —
 the Composer variation waits on Composer becoming a built-in LD model.
