@@ -49,33 +49,39 @@ Design history: [docs/adr/](docs/adr/).
 | `packages/phase1-resource-factory/` | Phase 1 front end #1 (GitHub Action): code; its drop-in workflow lives in `bootstrap/github-action-template/` |
 | `packages/phase1-cursor-extension/` | Phase 1 front end #2 (Cursor/VS Code extension): working-tree edits from the editor, calls Anthropic directly |
 | `bootstrap/cursor-automation/` | Phase 1 front end #3 (native Cursor automation): a drop-in `.cursor/` rule + command + MCP config; runs in Cursor's own agent (local prototype) |
-| `packages/phase1-cli/` | Phase 1 front end #4 (headless `autofactory` CLI): the full chain against a local working tree; the drop-in Claude Code skill that drives it lives in `bootstrap/claude-code/` |
+| `packages/phase1-cli/` | Phase 1 front end #4 (headless `autofactory` CLI): the full chain against a local working tree; the drop-in Claude Code and Codex skills that drive it live in `bootstrap/claude-code/` and `bootstrap/codex/` |
+| `bootstrap/copilot/` | Phase 1 front end #6 (GitHub Copilot cloud agent): a drop-in `.github/agents/` custom agent + `copilot-setup-steps.yml` that run the `autofactory` CLI inside Copilot's cloud sandbox |
 | `packages/beacon/` | Phase 2 release orchestrator (webhooks, discovery, trigger, monitor, optional Seer Autofix on revert) |
 | `packages/config-bridge/` | CLI that provisions/syncs the agent configs, graph, operational flags, and shared APP metrics between LD projects |
 | `config/agentcontrol/ai-configs/` | The six agent + two judge definitions (instructions live here and in LD) |
 | `config/agentcontrol/tools/` | The agents' tool definitions (descriptions + schemas), provisioned into LaunchDarkly's tools library and attached per variation — editable in the LD UI; execution stays in code (ADR 0011) |
 | `config/agentcontrol/graphs/` | The agent graph: chain order, routing conditions, per-agent write capabilities |
 | `config/agentcontrol/metrics/` | Shared APP-project metrics (Sentry-backed `sentry-errors-*` guardrails, ADR 0014) |
-| `bootstrap/` | One-command setup, plus the drop-in front-end templates (GitHub Action workflow, Cursor automation) |
+| `bootstrap/` | One-command setup, plus the drop-in front-end templates (GitHub Action workflow, Cursor automation, Claude Code + Codex skills/gates) |
 | `examples/demo-app/` | Local sandbox the agents run against in dry-run mode |
 | `docs/` | Pipeline overview, ADRs, design docs |
 
 ## Phase 1 front ends
 
-The same six-agent chain (one shared core in `packages/shared`) runs from four entry points;
-pick whichever fits where you work. All four create the same flag/metrics/tests and write the
+The same six-agent chain (one shared core in `packages/shared`) runs from six entry points;
+pick whichever fits where you work. All of them create the same flag/metrics/tests and write the
 same release manifest — they differ only in trigger, output, and which models run the agents.
 
 | Front end | Trigger | Output | Models | Status |
 |-----------|---------|--------|--------|--------|
-| **GitHub Action** — [`packages/phase1-resource-factory`](packages/phase1-resource-factory/), template in [`bootstrap/github-action-template/`](bootstrap/github-action-template/) | a pull request, in CI | commits to the PR branch | Anthropic / Bedrock / Vega / Cursor (flag-selected; model per agent from the AI config) | primary, verified path (Bedrock path not yet exercised live) |
+| **GitHub Action** — [`packages/phase1-resource-factory`](packages/phase1-resource-factory/), template in [`bootstrap/github-action-template/`](bootstrap/github-action-template/) | a pull request, in CI | commits to the PR branch | Anthropic / Bedrock / Vega / Cursor / OpenAI (flag-selected; bootstrap default is a 50/50 anthropic/cursor split per run, ADR 0018; model per agent from the AI config) | primary, verified path (Bedrock path not yet exercised live) |
 | **Cursor/VS Code extension** — [`packages/phase1-cursor-extension`](packages/phase1-cursor-extension/) | a button or a new commit, in the editor | edits left in your working tree | Anthropic API or Bedrock (Cursor can't expose its models to extensions) | working |
 | **Native Cursor automation** — [`bootstrap/cursor-automation`](bootstrap/cursor-automation/) | the `/autofactory` command in Cursor | edits left in your working tree | Cursor's own models (no API key) | local prototype; cloud (auto, PR-based) is a later phase |
-| **Headless CLI / Claude Code** — [`packages/phase1-cli`](packages/phase1-cli/), skill in [`bootstrap/claude-code/`](bootstrap/claude-code/) | `autofactory run` in a terminal, or `/autofactory` in Claude Code | edits left in your working tree | Anthropic API or Bedrock (model per agent from the AI config; the working-tree ceiling requires the sandboxed runner — see the CLI README) | new; full fidelity (judges, monitoring, gates) |
+| **Headless CLI / Claude Code / Codex** — [`packages/phase1-cli`](packages/phase1-cli/), skills in [`bootstrap/claude-code/`](bootstrap/claude-code/) and [`bootstrap/codex/`](bootstrap/codex/) | `autofactory run` in a terminal, `/autofactory` in Claude Code, or `$autofactory` in Codex | edits left in your working tree | Anthropic, Bedrock, or OpenAI — routed per surface (ADR 0018: Claude Code → Anthropic, Codex → OpenAI; the working-tree ceiling requires a sandboxed runner — see the CLI README) | new; full fidelity (judges, monitoring, gates) |
+| **GitHub Copilot cloud agent** — [`bootstrap/copilot/`](bootstrap/copilot/) | a Copilot cloud-agent session using the `autofactory` custom agent (agents panel, issue assignment, or `@copilot` on a PR) | commits to the session's PR branch | Anthropic (ADR 0018: `copilot` surface → Anthropic; the cloud sandbox needs a sandbox-confined runner) | infra validated live; in-session chain blocked by harness behavior — pair with the GitHub Action as the chain runner (see the bootstrap README) |
 
 Setup for the GitHub Action is below; the extension, the automation, and the CLI each have their
-own README. For the Claude Code path there is a standalone install guide:
-[INSTALL-CLAUDE-CODE.md](INSTALL-CLAUDE-CODE.md).
+own README. For the Claude Code, Codex, and Copilot paths there are standalone install guides:
+[INSTALL-CLAUDE-CODE.md](INSTALL-CLAUDE-CODE.md), [INSTALL-CODEX.md](INSTALL-CODEX.md), and
+[INSTALL-COPILOT.md](INSTALL-COPILOT.md).
+Locally-driven runs (CLI / Claude Code / Codex) set the developer as the created flag's
+**maintainer** in LaunchDarkly, resolved from `git config user.email`
+(override: `AUTOFACTORY_MAINTAINER_EMAIL`).
 
 ## Phase 1 setup (GitHub Action)
 
@@ -240,6 +246,31 @@ PR label instead (feature PRs only, not docs/chores). On a flag-worthy PR you ge
 The check is green when the code reviewer approves and red when it rejects. A red check is a
 review verdict, not a pipeline failure. PRs that do not need a flag (docs, dependency bumps,
 config changes) short-circuit after the first agent.
+
+### Optional: start from an issue instead of a PR (intake)
+
+The chain can also start one step earlier, at a GitHub issue (ADR 0019). The
+**issue coder** — an AgentControl agent like the rest — implements the issue on
+a branch `autofactory/issue-<n>`, pushes, and opens the PR; the regular chain
+then runs on that PR exactly as above. The two runs share the issue as their
+join key (the PR body carries an intent marker the Action reads into
+`TICKET_ID` and onto the run context), so tokens spent coding and tokens spent
+flagging roll up to the same ticket.
+
+From a clean checkout of the app repo, with the tooling repo's `.env`:
+
+```bash
+node packages/phase1-cli/dist/cli.js intake --issue 42 --root /path/to/app-repo
+```
+
+Requires a GitHub token that can push and open PRs (`GITHUB_TOKEN`,
+`AUTOFACTORY_INTAKE_TOKEN`, or a logged-in `gh`). Add `--dry-run` to have the
+coder reason about the issue without branching or editing, `--draft` for a
+draft PR, `--pr-label autofactory` for label-gated repos. To run it from
+Actions on `issues: labeled`, copy `bootstrap/github-action-template/auto-factory-intake.yml`
+(it needs a PAT: PRs opened with the workflow's own token don't trigger
+`pull_request` workflows). The canonical PR-triggered run is unchanged; the
+coder never executes on a PR.
 
 ### Behavior toggles
 

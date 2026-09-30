@@ -136,6 +136,11 @@ export async function runPhase1(opts: RunOptions): Promise<RunResult> {
         reporter.log(`⏸ approval gate: stopped before ${event.node}`);
       } else if (event.type === "replay-diverged") {
         reporter.log(`⛔ resume aborted: ${event.info.detail}`);
+      } else if (event.type === "awaiting-input") {
+        reporter.log(
+          `⏸ human input: ${event.node} paused with a question${event.question ? `: ${event.question}` : ""} — ` +
+            `answer in the release manifest's humanInput.answer, then re-run`,
+        );
       }
     },
     gate,
@@ -162,6 +167,7 @@ export async function runPhase1(opts: RunOptions): Promise<RunResult> {
     decision,
     ...(walk.pendingApproval ? { pendingApproval: walk.pendingApproval } : {}),
     ...(walk.loopExhausted ? { loopExhausted: walk.loopExhausted } : {}),
+    ...(walk.pendingInput ? { pendingInput: walk.pendingInput } : {}),
     mode: policy.mode,
     provider,
   };

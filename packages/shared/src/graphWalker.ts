@@ -96,6 +96,12 @@ export function declaredMaxVisits(graphDef: AgentGraphDefinition, edgeKey: strin
  * `accumulatedTags` can reach it whatever its class; and on the metrics-author SELF-loop the
  * rewind re-overlays the source's own routing tags afterwards, so the value survives regardless.
  * The classification is right; the argument for it was not.
+ *
+ * The M14 human-input pair (ADR 0017) arrived on `main` the same way, and belongs here for the
+ * same reason: both are the metrics author's LLM-produced claim about the pass it just made.
+ * Rewinding them is harmless — the walker reads the pause from the just-completed run's own
+ * result tags, never from `accumulatedTags`, and a run that sets the pause halts the walk
+ * before any loop edge could re-enter it.
  */
 const ROUTING_TAGS = new Set<string>([
   "skip_flagging",
@@ -107,6 +113,9 @@ const ROUTING_TAGS = new Set<string>([
   "risk_score",
   // See the note above this Set for why (ADR 0014).
   "sentry_guardrail",
+  // See the note above this Set for why (ADR 0017).
+  "needs_human_input",
+  "human_question",
 ]);
 
 /**
@@ -253,6 +262,16 @@ export interface WalkResult {
    * broken. Undefined when no gate halted the walk.
    */
   pendingApproval?: { node: string };
+  /**
+   * Set when a node ASKED FOR HUMAN INPUT (tag `needs_human_input=true`, e.g.
+   * the metrics author's M14 pause: trace delivery it cannot verify). The node
+   * itself completed — deliberately having created nothing — and the walk
+   * halted before edge selection, so downstream nodes did not run. Like
+   * pendingApproval this is a pause awaiting a human, not a stall or failure.
+   * The durable question/answer channel is the release manifest's `humanInput`
+   * block; `question` here is the short form from the `human_question` tag.
+   */
+  pendingInput?: { node: string; question?: string };
   /**
    * Set when a deterministic handoff shim (see handoffVerifier.ts) FAILED
    * after a node: a claim the node handed off could not be re-derived from
@@ -433,7 +452,8 @@ export type WalkEvent =
   | { type: "stalled"; stall: StallInfo }
   | { type: "loop-exhausted"; info: LoopExhaustedInfo }
   | { type: "replay-diverged"; info: ReplayDivergence }
-  | { type: "awaiting-approval"; node: string };
+  | { type: "awaiting-approval"; node: string }
+  | { type: "awaiting-input"; node: string; question?: string };
 
 /**
  * One line per advisory loop that ran out of budget WITHOUT failing the run. These
@@ -796,13 +816,15 @@ function reworkPreamble(
 
 /**
  * Build a node's prompt. Each node runs in its own conversation, so the prompt
- * carries the repo + PR header. The ROOT node always gets the PR body (even when
- * re-entered via a loop edge, which would otherwise look "non-root"); nodes with
- * an inbound edge also get the previous agent's brief. On a re-run (iteration>1)
- * a rework preamble is prepended.
+ * carries the repo + PR (or issue) header. The ENTRY node — the node this walk
+ * started at: the graph root, or the first node past any intake nodes (ADR 0019)
+ * — always gets the PR body and the Jev preclassification block (even when
+ * re-entered via a loop edge, which would otherwise look like a non-entry node);
+ * nodes with an inbound edge also get the previous agent's brief. On a re-run
+ * (iteration>1) a rework preamble is prepended.
  */
 function buildPrompt(
-  isRoot: boolean,
+  isEntry: boolean,
   hasInbound: boolean,
   iteration: number,
   inventory: Record<string, string>,
@@ -810,9 +832,12 @@ function buildPrompt(
   trigger?: LoopTrigger,
   humanFeedback?: string,
 ): string {
+  // Issue-shaped context (the intake entry point, ADR 0019) has no PR yet:
+  // the header names the issue and the branch the work lands on instead.
   const header = [
     ctx.REPO ? `Repository: ${ctx.REPO}` : "",
-    ctx.PR_NUMBER ? `Pull request: #${ctx.PR_NUMBER}` : "",
+    ctx.ISSUE_NUMBER ? `Issue: #${ctx.ISSUE_NUMBER}` : ctx.PR_NUMBER ? `Pull request: #${ctx.PR_NUMBER}` : "",
+    ctx.ISSUE_NUMBER && ctx.PR_BRANCH ? `Working branch: ${ctx.PR_BRANCH}` : "",
     ctx.PR_TITLE ? `Title: ${ctx.PR_TITLE}` : "",
   ]
     .filter(Boolean)
@@ -829,10 +854,15 @@ function buildPrompt(
         `=== END HUMAN GUIDANCE ===`,
     );
   }
-  // The root always sees the PR body; a re-entered root keeps it too.
-  if (isRoot && typeof ctx.PR_BODY === "string" && ctx.PR_BODY) parts.push(ctx.PR_BODY);
-  // The inbound brief (previous step output): present for non-root nodes and for
-  // a root re-entered via a loop edge.
+  // The entry node always sees the PR body; a re-entered entry node keeps it too.
+  if (isEntry && typeof ctx.PR_BODY === "string" && ctx.PR_BODY) parts.push(ctx.PR_BODY);
+  // PRECLASSIFICATION: the Jev prefill block (jev/preclassify.ts), entry node only —
+  // it annotates the PR body, so it travels with it (a re-entered entry keeps both).
+  if (isEntry && typeof ctx.PRECLASSIFICATION === "string" && ctx.PRECLASSIFICATION) {
+    parts.push(ctx.PRECLASSIFICATION);
+  }
+  // The inbound brief (previous step output): present for non-entry nodes and for
+  // an entry node re-entered via a loop edge.
   if (hasInbound) {
     const brief = typeof ctx.PREVIOUS_STEP_OUTPUT === "string" ? ctx.PREVIOUS_STEP_OUTPUT : "";
     if (brief) parts.push(brief);
@@ -859,6 +889,60 @@ function allNodeKeys(graphDef: AgentGraphDefinition): string[] {
 }
 
 /**
+ * Node keys that are INTAKE nodes: sources of an edge whose handoff declares
+ * `intake: true`. An intake node sits "left" of the chain's regular entry (e.g.
+ * the issue coder that produces the PR the rest of the chain then processes).
+ * It is the graph's root — the LaunchDarkly AI SDK requires every node to be
+ * reachable from the root — but PR-triggered runs enter the graph AFTER it.
+ */
+export function intakeNodeKeys(graphDef: AgentGraphDefinition): Set<string> {
+  const raw = graphDef.getConfig();
+  const keys = new Set<string>();
+  for (const [source, edges] of Object.entries(raw.edges ?? {})) {
+    if (edges.some((e) => e.handoff?.intake === true)) keys.add(source);
+  }
+  return keys;
+}
+
+/**
+ * The node a REGULAR (PR-shaped) run should start at: the root, unless the root
+ * is an intake node — then follow the intake edge(s) forward to the first node
+ * that isn't one. Lets the intake entry point be added to a graph without
+ * changing what every existing front end runs (ADR 0019).
+ */
+export function defaultEntryNode(graphDef: AgentGraphDefinition): AgentGraphNode {
+  const intake = intakeNodeKeys(graphDef);
+  let node = graphDef.rootNode();
+  const seen = new Set<string>();
+  while (node && intake.has(node.getKey()) && !seen.has(node.getKey())) {
+    seen.add(node.getKey());
+    const forward = node.getEdges().find((e) => e.handoff?.intake === true);
+    const next = forward ? graphDef.getNode(forward.key) : null;
+    if (!next) break;
+    node = next;
+  }
+  return node;
+}
+
+export interface WalkOptions {
+  /**
+   * Node key to start the walk at instead of the graph root. Unset → the
+   * regular entry (`defaultEntryNode`: the root, skipping past intake nodes).
+   * Set explicitly to an intake node's key to run the intake entry point.
+   * A resume must pass the same value as the walk that produced its journal —
+   * a different entry re-derives a different first node, which the replay
+   * reports as `replayDiverged`.
+   */
+  startAt?: string;
+  /**
+   * Node keys after which the walk STOPS cleanly (no edge selection, no stall):
+   * the intake run executes only its entry node — the hand-off to the rest of
+   * the chain happens out-of-band (the PR it opens triggers a regular run).
+   */
+  stopAfter?: string[];
+}
+
+/**
  * Everything nondeterministic or side-effecting that a walk depends on, in one
  * bundle.
  *
@@ -870,7 +954,7 @@ function allNodeKeys(graphDef: AgentGraphDefinition): string[] {
  * in `ResumeInput`, or replay silently diverges. This bundle exists to make that
  * obligation visible at the type level rather than in a comment nobody reads.
  */
-export interface WalkInputs {
+export interface WalkInputs extends WalkOptions {
   /**
    * LaunchDarkly graph tracker (per-edge handoff metrics). NOT called for edges
    * whose source node was replayed — the original walk already recorded them, and
@@ -979,7 +1063,7 @@ export async function walkGraph(
   context: Record<string, unknown>,
   inputs: WalkInputs = {},
 ): Promise<WalkResult> {
-  const { graphTracker, onEvent, gate, judgeHook, verifier, resume } = inputs;
+  const { graphTracker, onEvent, gate, judgeHook, verifier, resume, startAt } = inputs;
   const journal = resume?.journal ?? [];
   const runs: NodeRun[] = [];
   const accumulatedTags: Record<string, string> = {};
@@ -1017,13 +1101,13 @@ export async function walkGraph(
   const loopEdgeShadowed: NonNullable<WalkResult["loopEdgeShadowed"]> = [];
   const shadowWarned = new Set<string>();
 
-  const rootKey = graphDef.getConfig().root;
   // Run-level termination backstop, scaled to graph size (nodeCount × (hardCap+1));
   // the true control is the per-loop-edge cap. Guards untagged cycles and a
   // maliciously edited served graph. NOT a guarantee of never preempting a legal
   // walk: a graph that chains several long loop segments can in principle exceed
   // this within its per-edge budgets. Unreachable with the committed graph even at
-  // maximum grants (~56 runs vs a cap of 66), and tripping early fails SAFE — the
+  // maximum grants (~56 runs vs a cap of 77 — seven nodes, counting the intake coder a
+  // regular walk never enters), and tripping early fails SAFE — the
   // walk reports loopExhausted (run-cap), never a false success.
   const maxTotalNodeRuns = Math.max(1, allNodeKeys(graphDef).length) * (MAX_VISITS_HARD_CAP + 1);
   let totalRuns = 0;
@@ -1035,11 +1119,22 @@ export async function walkGraph(
   // tracker's summary after its run (the runner records tokens on the tracker).
   const totalTokens: LDTokenUsage = { total: 0, input: 0, output: 0 };
 
-  let node: AgentGraphNode | null = graphDef.rootNode();
-  // Handoff of the edge we traversed INTO the current node (root has none).
+  let node: AgentGraphNode | null;
+  if (startAt) {
+    node = graphDef.getNode(startAt);
+    if (!node) throw new Error(`walkGraph: start node '${startAt}' is not in the graph`);
+  } else {
+    node = defaultEntryNode(graphDef);
+  }
+  // The node this walk entered at: gets the PR body / preclassification in its prompt
+  // (see buildPrompt). The graph root unless the root is an intake node (ADR 0019).
+  const entryKey = node.getKey();
+  const stopAfter = new Set(inputs.stopAfter ?? []);
+  // Handoff of the edge we traversed INTO the current node (an entry node has none).
   let inboundHandoff: Record<string, unknown> | undefined;
   let stalledAt: StallInfo | undefined;
   let pendingApproval: { node: string } | undefined;
+  let pendingInput: { node: string; question?: string } | undefined;
   let verificationFailed: HandoffVerification | undefined;
   let loopExhausted: LoopExhaustedInfo | undefined;
   let replayDiverged: ReplayDivergence | undefined;
@@ -1137,7 +1232,7 @@ export async function walkGraph(
     const humanFeedback = replaying ? undefined : pendingHumanFeedback;
     if (!replaying) pendingHumanFeedback = undefined;
     const prompt = buildPrompt(
-      key === rootKey,
+      key === entryKey,
       inboundHandoff !== undefined,
       iteration,
       inventory,
@@ -1297,6 +1392,23 @@ export async function walkGraph(
         console.warn(`[verify] shim errored for '${key}' (non-fatal): ${e instanceof Error ? e.message : e}`);
       }
     }
+
+    // Agent-initiated pause (metrics author rule M14): the node hit a question
+    // only a human can answer (e.g. trace delivery it cannot verify) and
+    // deliberately created nothing. Halt before edge selection — a pause
+    // awaiting input, not a stall. The durable question/answer lives in the
+    // release manifest's humanInput block; the human_question tag is the short
+    // form the front ends surface. Resume = a fresh walk (same as approval
+    // gates): the re-run finds humanInput.answer in the manifest and proceeds.
+    if (result.tags.needs_human_input === "true") {
+      const question = result.tags.human_question;
+      pendingInput = { node: key, ...(question ? { question } : {}) };
+      onEvent?.({ type: "awaiting-input", node: key, ...(question ? { question } : {}) });
+      break;
+    }
+
+    // Intentional stop (WalkOptions.stopAfter): the caller hands off out-of-band.
+    if (stopAfter.has(key)) break;
 
     // Pick the next edge whose handoff conditions pass. Only edges carrying
     // `max_visits` (the author-designated loop edges) are budget-capped; untagged
@@ -1587,13 +1699,14 @@ export async function walkGraph(
   }
 
   // Graph-level ("global") metrics, alongside the per-node metrics recorded
-  // above. A pause at an approval gate is NOT a finished invocation — emit
-  // nothing graph-level for it: the post-approval re-run walks the chain on a
-  // fresh tracker (fresh runId) and reports the complete run. Likewise skip
-  // when nothing ran (e.g. a disabled graph): there is no invocation to score.
+  // above. A pause — at an approval gate, or on an agent's request for human
+  // input — is NOT a finished invocation; emit nothing graph-level for it: the
+  // post-answer re-run walks the chain on a fresh tracker (fresh runId) and
+  // reports the complete run. Likewise skip when nothing ran (e.g. a disabled
+  // graph): there is no invocation to score.
   // Defensive try/catch: metric emission must never fail the walk.
   //
-  // `!anyReplayed` is the third condition, and it is the one that arrived with the loop
+  // `!anyReplayed` is the fourth condition, and it is the one that arrived with the loop
   // machinery rather than with these metrics. Every quantity here describes A WALK, and on a
   // resume only part of the walk happened in this process: `trackDuration` would time the tail
   // while `trackPath` reported the whole chain, `trackTotalTokens` would count only the live
@@ -1609,7 +1722,7 @@ export async function walkGraph(
   // scratch (no journal), so it is unaffected. Double-counting one PR as two invocations, and
   // attributing the whole path's tokens to its tail, is the worse error: it corrupts the
   // aggregate for every consumer rather than omitting one row.
-  if (graphTracker && !pendingApproval && !anyReplayed && runs.length > 0) {
+  if (graphTracker && !pendingApproval && !pendingInput && !anyReplayed && runs.length > 0) {
     try {
       graphTracker.trackPath(runs.map((r) => r.configKey));
       graphTracker.trackDuration(Date.now() - startMs);
@@ -1664,7 +1777,10 @@ export async function walkGraph(
   }
 
   const reached = new Set(runs.map((r) => r.configKey));
-  const skipped = allNodeKeys(graphDef).filter((k) => !reached.has(k));
+  // Intake nodes sit before the regular entry; a run that entered past them
+  // didn't "skip" them any more than it skipped the PR being opened.
+  const intake = intakeNodeKeys(graphDef);
+  const skipped = allNodeKeys(graphDef).filter((k) => !reached.has(k) && !intake.has(k));
 
   return {
     runs,
@@ -1673,6 +1789,7 @@ export async function walkGraph(
     skipped,
     ...(stalledAt ? { stalledAt } : {}),
     ...(pendingApproval ? { pendingApproval } : {}),
+    ...(pendingInput ? { pendingInput } : {}),
     ...(verificationFailed ? { verificationFailed } : {}),
     ...(loopExhausted ? { loopExhausted } : {}),
     ...(replayDiverged ? { replayDiverged } : {}),

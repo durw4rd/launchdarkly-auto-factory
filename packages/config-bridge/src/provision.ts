@@ -37,6 +37,9 @@ export interface ProvisionResult {
   /** APP-project metrics (config/agentcontrol/metrics/) created / found. */
   metricsCreated: string[];
   metricsExisting: string[];
+  /** Custom model configs (config/agentcontrol/model-configs/) created / found. */
+  modelConfigsCreated: string[];
+  modelConfigsExisting: string[];
 }
 
 /** A tool-definition file (config/agentcontrol/tools/<key>.json), in the
@@ -114,8 +117,36 @@ interface AiVariation {
   key: string;
   tools?: unknown;
   toolKeys?: unknown;
+  /**
+   * Copy every field from the named sibling committed variation (instructions,
+   * messages, tools, judgeConfiguration, …), then apply this variation's own
+   * declared fields on top. Keeps provider variations (e.g. `openai`) at one
+   * source of truth instead of duplicating 50KB instruction blocks per model.
+   */
+  copyFrom?: string;
   [k: string]: unknown;
 }
+
+/**
+ * Committed targeting rule, shared by flag files and AI-config files.
+ * `variation` names the served variation by VALUE (flags) or KEY (AI configs);
+ * the provisioner resolves it to an index / variation id at apply time.
+ * Applied on CREATE only — an existing resource's targeting is never touched
+ * (runtime state; same contract as the rest of provisioning).
+ */
+interface CommittedRule {
+  description?: string;
+  clauses: Array<{ contextKind?: string; attribute: string; op: string; values: unknown[]; negate?: boolean }>;
+  variation?: string;
+  /** Percentage rollout across variations (flags only), weights in 1/100,000ths. */
+  rollout?: { contextKind?: string; variations: Array<{ variation: string; weight: number }> };
+}
+interface CommittedTargeting {
+  on?: boolean;
+  fallthroughVariation?: string;
+  rules?: CommittedRule[];
+}
+
 interface AiConfigFile {
   key: string;
   name: string;
@@ -124,7 +155,15 @@ interface AiConfigFile {
   tags?: string[];
   /** Required by the API for mode "judge" (e.g. "$ld:ai:judge:<config-key>"). */
   evaluationMetricKey?: string;
+  /**
+   * Required by the API for custom judges alongside evaluationMetricKey: the
+   * evaluation metric's success direction. false = higher score is better.
+   * Offline evaluations derive pass/fail from it.
+   */
+  isInverted?: boolean;
   variations?: AiVariation[];
+  /** Per-provider serving rules (e.g. run.provider=openai → openai variation). */
+  targeting?: CommittedTargeting;
 }
 interface AgentGraphFile {
   key: string;
@@ -140,6 +179,9 @@ interface AgentGraphFile {
 interface FlagFile {
   key: string;
   name: string;
+  variations?: Array<{ value: unknown }>;
+  /** Applied on create via JSON Patch (rules/fallthrough/on per environment). */
+  targeting?: CommittedTargeting;
   [k: string]: unknown;
 }
 
@@ -228,6 +270,80 @@ async function attachTools(
   }
 }
 
+/**
+ * Resolve `copyFrom` references among committed variations: source fields
+ * first, the variation's own declared fields on top. Exported so `upgrade`
+ * applies the same semantics when diffing live content against committed —
+ * otherwise a copyFrom variation (no literal `instructions`) never syncs.
+ */
+export function resolveCopyFromList<V extends { key: string; copyFrom?: string }>(
+  variations: V[],
+): { resolved: V[]; errors: string[] } {
+  const errors: string[] = [];
+  const resolved = variations.map((v) => {
+    if (typeof v.copyFrom !== "string") return v;
+    const src = variations.find((s) => s.key === v.copyFrom);
+    if (!src) {
+      errors.push(`${v.key}: copyFrom '${v.copyFrom}' names no committed variation`);
+      return v;
+    }
+    const { copyFrom: _copyFrom, ...own } = v;
+    return { ...src, ...own } as V;
+  });
+  return { resolved, errors };
+}
+
+/** Resolve `copyFrom` references among a config's committed variations. */
+function resolveCopyFrom(cfg: AiConfigFile, result: ProvisionResult): AiVariation[] {
+  const { resolved, errors } = resolveCopyFromList(cfg.variations ?? []);
+  for (const e of errors) {
+    result.failures.push({ resource: `${cfg.key}/${e.split(":")[0]}`, status: 0, message: e });
+  }
+  return resolved;
+}
+
+/**
+ * Apply committed targeting to a newly created AI config: one addRule per
+ * committed rule, in every environment. Create-path only — never runs against
+ * a pre-existing config, so live targeting edits are never clobbered.
+ */
+async function applyAiConfigTargeting(
+  ld: LdClient,
+  cfg: AiConfigFile,
+  result: ProvisionResult,
+  dryRun: boolean,
+): Promise<void> {
+  const rules = cfg.targeting?.rules ?? [];
+  if (rules.length === 0 || dryRun) return;
+  try {
+    const live = await ld.getAiConfigTargeting<{
+      variations?: Array<{ _id: string; value?: { _ldMeta?: { variationKey?: string } } }>;
+      environments?: Record<string, unknown>;
+    }>(cfg.key);
+    const idByKey = new Map(
+      (live.data.variations ?? [])
+        .filter((v) => v.value?._ldMeta?.variationKey)
+        .map((v) => [v.value?._ldMeta?.variationKey as string, v._id]),
+    );
+    const instructions = rules.map((r) => {
+      const variationId = r.variation ? idByKey.get(r.variation) : undefined;
+      if (!variationId) throw new Error(`rule serves unknown variation '${r.variation}'`);
+      return {
+        kind: "addRule",
+        variationId,
+        clauses: r.clauses.map((c) => ({ contextKind: c.contextKind ?? "user", attribute: c.attribute, op: c.op, values: c.values, negate: c.negate ?? false })),
+        ...(r.description ? { description: r.description } : {}),
+      };
+    });
+    for (const env of Object.keys(live.data.environments ?? {})) {
+      await ld.patchAiConfigTargeting(cfg.key, { environmentKey: env, instructions, comment: "provisioned targeting (bootstrap default)" });
+    }
+  } catch (e) {
+    const err = e as LdApiError;
+    result.failures.push({ resource: `${cfg.key} targeting`, status: err.status ?? 0, message: err.responseBody ?? String(e) });
+  }
+}
+
 async function provisionAiConfig(
   ld: LdClient,
   cfg: AiConfigFile,
@@ -235,7 +351,7 @@ async function provisionAiConfig(
   dryRun: boolean,
   tools?: ToolLibrary,
 ): Promise<void> {
-  const variations = cfg.variations ?? [];
+  const variations = resolveCopyFrom(cfg, result);
   const existing = await ld.getAiConfig<{ variations?: { key: string }[] }>(cfg.key);
 
   let existingVarKeys = new Set<string>();
@@ -251,6 +367,9 @@ async function provisionAiConfig(
       tags: cfg.tags ?? [],
       // Judge mode requires the evaluation metric key at creation time.
       ...(cfg.evaluationMetricKey ? { evaluationMetricKey: cfg.evaluationMetricKey } : {}),
+      // Judge mode also requires the metric's success direction (API rejects a
+      // custom judge without it: "isInverted is required for a custom judge").
+      ...(cfg.isInverted !== undefined ? { isInverted: cfg.isInverted } : {}),
     };
     let defaultMapped: Record<string, unknown> | undefined;
     if (variations[0]) {
@@ -290,6 +409,12 @@ async function provisionAiConfig(
       result.failures.push({ resource: `${cfg.key}/${v.key}`, status: err.status ?? 0, message: err.responseBody ?? String(e) });
     }
   }
+
+  // Committed targeting rules land only on configs THIS provision created —
+  // an existing config's targeting is runtime state and never touched here.
+  if (existing.status !== 200) {
+    await applyAiConfigTargeting(ld, cfg, result, dryRun);
+  }
 }
 
 async function provisionGraph(
@@ -327,7 +452,89 @@ async function provisionGraph(
   }
 }
 
+/**
+ * Apply committed targeting to a newly created flag via JSON Patch: replace
+ * rules, fallthrough, and the on state in every environment. Variations are
+ * referenced by VALUE in the committed file and resolved to indexes here.
+ * Create-path only (see provisionFlag).
+ */
+async function applyFlagTargeting(ld: LdClient, flag: FlagFile, result: ProvisionResult): Promise<void> {
+  const t = flag.targeting;
+  if (!t) return;
+  try {
+    const idx = new Map((flag.variations ?? []).map((v, i) => [String(v.value), i]));
+    const byValue = (value: string | undefined, what: string): number => {
+      const i = value !== undefined ? idx.get(value) : undefined;
+      if (i === undefined) throw new Error(`${what} names unknown variation '${value}'`);
+      return i;
+    };
+    const rules = (t.rules ?? []).map((r) => ({
+      ...(r.description ? { description: r.description } : {}),
+      clauses: r.clauses.map((c) => ({ contextKind: c.contextKind ?? "user", attribute: c.attribute, op: c.op, values: c.values, negate: c.negate ?? false })),
+      ...(r.rollout
+        ? {
+            rollout: {
+              contextKind: r.rollout.contextKind ?? "user",
+              variations: r.rollout.variations.map((rv) => ({ variation: byValue(rv.variation, "rollout arm"), weight: rv.weight })),
+            },
+          }
+        : { variation: byValue(r.variation, "rule serve") }),
+      trackEvents: false,
+    }));
+    const live = await ld.getFlag<{ environments?: Record<string, unknown> }>(flag.key);
+    for (const env of Object.keys(live.data.environments ?? {})) {
+      const ops: unknown[] = [{ op: "replace", path: `/environments/${env}/rules`, value: rules }];
+      if (t.fallthroughVariation !== undefined) {
+        ops.push({ op: "replace", path: `/environments/${env}/fallthrough`, value: { variation: byValue(t.fallthroughVariation, "fallthrough") } });
+      }
+      if (t.on !== undefined) {
+        ops.push({ op: "replace", path: `/environments/${env}/on`, value: t.on });
+      }
+      await ld.patchFlagJson(flag.key, ops, "provisioned targeting (bootstrap default)");
+    }
+  } catch (e) {
+    const err = e as LdApiError;
+    result.failures.push({ resource: `flag ${flag.key} targeting`, status: err.status ?? 0, message: err.responseBody ?? String(e) });
+  }
+}
+
 /** Create an operational flag if absent (idempotent; existing flag left untouched). */
+/**
+ * A custom model config (config/agentcontrol/model-configs/*.json) — a model
+ * that isn't in LaunchDarkly's built-in catalog (e.g. TypeSafe's Jev), in the
+ * shape the model-configs API consumes. AI-config variations reference it by
+ * `modelConfigKey`, so it must exist before any variation that uses it.
+ */
+export interface ModelConfigFile {
+  key: string;
+  name: string;
+  id: string;
+  provider?: string;
+  params?: Record<string, unknown>;
+  customParams?: Record<string, unknown>;
+  costPerInputToken?: number;
+  costPerOutputToken?: number;
+  tags?: string[];
+}
+
+/** Create-only, like tools: an existing model config (and its LD-side edits) is never touched. */
+async function provisionModelConfig(ld: LdClient, mc: ModelConfigFile, result: ProvisionResult, dryRun: boolean): Promise<void> {
+  const path = `/api/v2/projects/${ld.projectKey}/ai-configs/model-configs`;
+  const beta = { "LD-API-Version": "beta" };
+  try {
+    const existing = await ld.request({ path: `${path}/${encodeURIComponent(mc.key)}`, headers: beta, okStatuses: [404] });
+    if (existing.status === 200) {
+      result.modelConfigsExisting.push(mc.key);
+      return;
+    }
+    if (!dryRun) await ld.request({ method: "POST", path, headers: beta, body: mc });
+    result.modelConfigsCreated.push(mc.key);
+  } catch (e) {
+    const err = e as LdApiError;
+    result.failures.push({ resource: `model-config ${mc.key}`, status: err.status ?? 0, message: err.responseBody ?? String(e) });
+  }
+}
+
 async function provisionFlag(ld: LdClient, flag: FlagFile, result: ProvisionResult, dryRun: boolean): Promise<void> {
   // 404-tolerant existence check, so an already-configured flag (and its
   // targeting) is never overwritten.
@@ -337,7 +544,13 @@ async function provisionFlag(ld: LdClient, flag: FlagFile, result: ProvisionResu
     return;
   }
   try {
-    if (!dryRun) await ld.createFlag(flag);
+    // `targeting` is a provisioner concept, not a create-body field — strip it
+    // and apply post-create.
+    const { targeting: _targeting, ...body } = flag;
+    if (!dryRun) {
+      await ld.createFlag(body);
+      await applyFlagTargeting(ld, flag, result);
+    }
     result.flagsCreated.push(flag.key);
   } catch (e) {
     const err = e as LdApiError;
@@ -433,6 +646,11 @@ export interface ProvisionOptions {
    * metrics (sentry-errors*). When omitted, metrics are skipped with a log.
    */
   appLd?: LdClient;
+  /**
+   * Directory of custom model-config JSON files. Default
+   * `config/agentcontrol/model-configs`. Provisioned before AI configs.
+   */
+  modelConfigsDir?: string;
   /** When true, perform reads only — report what would be created without writing. */
   dryRun?: boolean;
 }
@@ -442,7 +660,7 @@ export async function provision(ld: LdClient, opts: ProvisionOptions): Promise<P
     configsCreated: [], configsExisting: [], variationsCreated: 0, variationsExisting: 0,
     toolsStripped: [], toolsCreated: [], toolsExisting: [],
     failures: [], graphsCreated: [], graphsExisting: [], flagsCreated: [], flagsExisting: [],
-    metricsCreated: [], metricsExisting: [],
+    metricsCreated: [], metricsExisting: [], modelConfigsCreated: [], modelConfigsExisting: [],
   };
   const dryRun = opts.dryRun ?? false;
   const toolsDir = opts.toolsDir ?? "config/agentcontrol/tools";
@@ -450,6 +668,12 @@ export async function provision(ld: LdClient, opts: ProvisionOptions): Promise<P
   // Tools first: variations reference them as {key, version}, so the library
   // must exist before any variation create.
   const toolLibrary = await provisionTools(ld, toolsDir, result, dryRun);
+
+  // Custom model configs next: variations reference them by modelConfigKey.
+  for (const file of listJson(opts.modelConfigsDir ?? "config/agentcontrol/model-configs")) {
+    const mc = JSON.parse(readFileSync(file, "utf8")) as ModelConfigFile;
+    await provisionModelConfig(ld, mc, result, dryRun);
+  }
 
   // Judge-mode configs next: agent variations may carry a `judgeConfiguration`
   // that references a judge by key, so the judges must exist before the agents.

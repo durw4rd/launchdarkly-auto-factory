@@ -30,8 +30,11 @@ with `--root` pointing at the user's repo — and run it **in the background**
 several minutes across 5–6 agents; your job is live narration, not a spinner.
 
 ```bash
-cd "$AUTOFACTORY_HOME" && node packages/phase1-cli/dist/cli.js run --root "<absolute path to the user's repo>"
+cd "$AUTOFACTORY_HOME" && AUTOFACTORY_SURFACE=claude-code node packages/phase1-cli/dist/cli.js run --root "<absolute path to the user's repo>"
 ```
+
+Always include `AUTOFACTORY_SURFACE=claude-code` — LaunchDarkly targets the
+execution provider and models by surface. Never set it to another value.
 
 **Progress relay loop:** check the background shell's new output (BashOutput)
 roughly every 30–60 seconds, and after each check tell the user — in one short
@@ -51,6 +54,10 @@ command exits, handle the exit code (below).
 
 Other rules:
 
+- NEVER re-run the chain after a failure (exit 1, a ⛔ deterministic check, or
+  a rejected review) unless the user explicitly asks — a re-run bills a full
+  chain, and when the cause is systemic it fails identically. Report what
+  failed and wait.
 - NEVER set the `APPROVAL_MODE` or `RISK_THRESHOLD` environment variables —
   they silently override the LaunchDarkly approval flags.
 - `--dry-run` gives a read-only preview (no flags created, no edits) if the
@@ -66,6 +73,7 @@ Other rules:
 | 1 | Review REJECTED, chain incomplete, or a deterministic check failed | Summarize; a rejection is a **review verdict, not a pipeline failure** |
 | 2 | Usage/configuration problem (missing env, nothing to process) | Fix or ask the user; don't retry blindly |
 | 3 | **Paused at an approval gate** | See below |
+| 4 | **Paused on an agent's question** (needs a human answer) | See below |
 
 ## Approval gates (exit 3)
 
@@ -80,12 +88,30 @@ command (`--approve <nodeKey>`, accumulating every previously approved step).
 
 Never approve a gate yourself — that decision is the human's.
 
+## Agent questions (exit 4)
+
+An agent (the metrics author) paused the chain on a question it could not
+answer from the repo — typically "do this service's OpenTelemetry traces
+actually reach LaunchDarkly?" when wiring the LD evaluation hook for the first
+time. Nothing was created for that step or anything after it.
+
+1. Relay the question to the user VERBATIM (the CLI prints it; the agent's full
+   analysis is in the step output above it).
+2. When the user answers, write their answer into the release manifest the CLI
+   names (`.release-flags/pr-<N>.json`) as `"humanInput": {"answer": "<their
+   answer>"}` — keep the existing `question` field beside it.
+3. Re-run the same command. The fresh run reads the answer and completes.
+
+Never invent or assume the answer yourself — if the user says they don't know,
+suggest answering `use track()` (the agent then falls back to event metrics).
+
 ## Summarizing a finished run
 
 Relay from the CLI's final summary block, verbatim where possible:
 
 - the verdict line;
-- flag and metric links (LaunchDarkly URLs);
+- flag and metric links (LaunchDarkly URLs) — the flag is created with the
+  user as maintainer (from their git email);
 - the manifest path under `.release-flags/`;
 - judge scores, stall or deterministic-check failures if present;
 - the fenced JSON verdict block as-is;

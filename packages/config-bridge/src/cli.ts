@@ -25,7 +25,7 @@
  *
  *   bridge init [--yes] [--provider anthropic|bedrock|cursor]
  *               [--factory-project <key>] [--app-project <key>] [--ld-env <key>]
- *               [--front-end github-action|claude-code|cursor-automation|none]
+ *               [--front-end github-action|claude-code|codex|cursor-automation|copilot|none]
  *               [--app-repo <owner/name>] [--app-repo-path <dir>]
  *               [--tool-repo <owner/name>] [--no-pr] [--base-url <url>]
  *       Guided first-time setup: create/confirm the LD projects, fetch the SDK
@@ -66,6 +66,7 @@ function logProvision(r: Awaited<ReturnType<typeof provision>>): void {
   console.log(`Flags:      ${r.flagsCreated.length} created, ${r.flagsExisting.length} existing`);
   console.log(`Tools:      ${r.toolsCreated.length} created, ${r.toolsExisting.length} existing`);
   console.log(`Metrics:    ${r.metricsCreated.length} created, ${r.metricsExisting.length} existing (APP project)`);
+  console.log(`Models:     ${r.modelConfigsCreated.length} created, ${r.modelConfigsExisting.length} existing (custom model configs)`);
   if (r.toolsStripped.length) {
     console.log(`⚠ tools stripped from ${r.toolsStripped.length} variation(s) — our snapshots hold only tool/snippet references, not definitions, so re-attach them in LD if the provider needs them`);
   }

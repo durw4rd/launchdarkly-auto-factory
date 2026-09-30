@@ -178,7 +178,7 @@ const USE_EXISTING_FLAG_TOOL: AnthropicToolDef = {
 const CREATE_METRIC_TOOL: AnthropicToolDef = {
   name: "create_metric",
   description:
-    "Create a guarded-release metric in LaunchDarkly (the app/data-plane project). TWO backings: (1) EVENT-backed (default) — pass event_key; you must FIRST instrument the matching event in code (a LaunchDarkly `track(event_key, …)` call on the path the flag wraps, via edit_file) so the metric has data once live — EXCEPTION: event_key `sentry-errors` is fed by the LD↔Sentry integration (no track() emitter). Prefer reusing provisioned `sentry-errors-binary` / `sentry-errors-count` via list_metrics when Sentry is present (ADR 0014). (2) TRACE-backed — pass trace_query (an observability span filter, e.g. service_name=x AND span_name=\"GET /api/y\") INSTEAD of event_key; valid ONLY when the flag is evaluated inside the matched trace (the observability SDK's afterEvaluation hook enriches the span — see your Metric Backing rules), and requires the service to already emit spans. Latency-category trace metrics measure the span's duration (override with trace_value_location). Idempotent: re-creating an existing key is a no-op. After it succeeds the metrics_created/metric_keys tags are updated for you.",
+    "Create a guarded-release metric in LaunchDarkly (the app/data-plane project). TWO backings: (1) EVENT-backed (default) — pass event_key; FIRST instrument the matching event in code (a LaunchDarkly `track(event_key, …)` call on the path the flag wraps, via edit_file) so the metric has data once live. EXCEPTION: event_key `sentry-errors` is fed by the LD↔Sentry integration (no track() emitter) — prefer reusing provisioned `sentry-errors-binary`/`sentry-errors-count` via list_metrics when Sentry is present. (2) TRACE-backed — pass trace_query (a span filter, e.g. service_name=x AND span_name=\"GET /api/y\") INSTEAD of event_key; valid ONLY when a LaunchDarkly evaluation hook (o11y plugin or OTel tracing hook) enriches spans in the matched trace AND those traces reach LaunchDarkly — see your Metric Backing rules. Latency-category trace metrics measure span duration (override with trace_value_location). Idempotent: re-creating a key is a no-op; on success the metrics_created/metric_keys tags update.",
   input_schema: {
     type: "object",
     properties: {
@@ -428,7 +428,7 @@ const QUERY_RELATED_REPOS_TOOL: AnthropicToolDef = {
 const WRITE_MANIFEST_TOOL: AnthropicToolDef = {
   name: "write_manifest",
   description:
-    "Create or update the release manifest (.release-flags/pr-<N>.json). Pass only the fields you own — they are MERGED into the existing file (agent fields: flagKey, scope, targetVariation, releasePlan.*). Set targetVariation (e.g. 'v2') whenever this PR's code path lives under a specific variation of an existing flag — Beacon releases exactly that variation on deploy; omit it for a fresh flag (whole-flag release of v1). The human-editable releaseIntent block is auto-initialized on first write and PRESERVED on later writes (you cannot overwrite it). The file is validated, written as schema 1.2, and committed to the PR branch automatically — do not also edit it with write_file/edit_file.",
+    "Create or update the release manifest (.release-flags/pr-<N>.json). Pass only the fields you own — they are MERGED into the existing file (agent fields: flagKey, scope, targetVariation, releasePlan.*, humanInput.question). Set targetVariation (e.g. 'v2') whenever this PR's code path lives under a specific variation of an existing flag — Beacon releases exactly that variation on deploy; omit it for a fresh flag (whole-flag release of v1). The human-editable releaseIntent block is auto-initialized on first write and PRESERVED on later writes (you cannot overwrite it). humanInput carries a question you need a human to answer (a pause per your instructions): you may set humanInput.question; humanInput.answer is HUMAN-owned and always preserved — you can never write or clear it. The file is validated, written as schema 1.2, and committed to the PR branch automatically — do not also edit it with write_file/edit_file.",
   input_schema: {
     type: "object",
     properties: {
@@ -689,6 +689,14 @@ export class SandboxToolExecutor {
     private readonly allowWriteManifest = false,
     /** Steward grade: `write_manifest` may also update an existing releaseIntent. */
     private readonly stewardManifest = false,
+    /**
+     * Append `[skip ci]` to `commit_and_push` commits (default). The PR chain
+     * pushes onto an EXISTING PR, so its commits must not re-trigger the
+     * workflow. The intake entry point (ADR 0019) is the opposite: its push
+     * creates the branch whose PR must trigger the regular chain, and GitHub
+     * suppresses `pull_request` runs when the head commit says [skip ci].
+     */
+    private readonly skipCi = true,
   ) {}
 
   /** Resolve a repo-relative path and reject anything escaping the sandbox root. */
@@ -1350,6 +1358,34 @@ export class SandboxToolExecutor {
       }
     }
 
+    // humanInput: the agent side of the M14 pause channel. The agent may set
+    // or update `question`; `answer` is HUMAN-owned and structurally protected
+    // — an existing answer survives every agent write, and an agent-supplied
+    // `answer` is silently dropped (mirror of the releaseIntent protection).
+    const existingHuman = existing.humanInput as Record<string, unknown> | undefined;
+    const incHuman =
+      inc.humanInput && typeof inc.humanInput === "object" && !Array.isArray(inc.humanInput)
+        ? (inc.humanInput as Record<string, unknown>)
+        : undefined;
+    let humanInput: Record<string, unknown> | undefined;
+    let humanNote = "";
+    if (incHuman) {
+      humanInput = {
+        ...(typeof incHuman.question === "string" && incHuman.question.trim()
+          ? { question: incHuman.question }
+          : typeof existingHuman?.question === "string"
+            ? { question: existingHuman.question }
+            : {}),
+        ...(existingHuman?.answer !== undefined ? { answer: existingHuman.answer } : {}),
+      };
+      humanNote =
+        existingHuman?.answer !== undefined
+          ? "; humanInput.question set (existing human answer PRESERVED — you cannot write it)"
+          : "; humanInput.question set (awaiting a human answer in the manifest)";
+    } else if (existingHuman) {
+      humanInput = existingHuman;
+    }
+
     // releaseIntent: create-if-absent for agents; steward grade may update it.
     const existingIntent = existing.releaseIntent as Record<string, unknown> | undefined;
     let intent: Record<string, unknown>;
@@ -1369,10 +1405,10 @@ export class SandboxToolExecutor {
     }
 
     const {
-      releasePlan: _ip, releaseOverrides: _io, releaseIntent: _ii, schemaVersion: _iv, ...incRest
+      releasePlan: _ip, releaseOverrides: _io, releaseIntent: _ii, humanInput: _ih, schemaVersion: _iv, ...incRest
     } = inc;
     const {
-      releasePlan: _ep, releaseOverrides: _eo, releaseIntent: _ei, schemaVersion: _ev, ...existRest
+      releasePlan: _ep, releaseOverrides: _eo, releaseIntent: _ei, humanInput: _eh, schemaVersion: _ev, ...existRest
     } = existing;
     const manifest: Record<string, unknown> = {
       schemaVersion: "1.2",
@@ -1380,6 +1416,7 @@ export class SandboxToolExecutor {
       ...incRest,
       releasePlan: mergedPlan,
       releaseIntent: intent,
+      ...(humanInput && Object.keys(humanInput).length > 0 ? { humanInput } : {}),
     };
 
     // Deterministic intent check — report problems to the agent, never block the write.
@@ -1414,7 +1451,7 @@ export class SandboxToolExecutor {
 
     return {
       content:
-        `${existed ? "Updated" : "Created"} ${rel} (schema 1.2); ${intentNote}; ${commitNote}.` +
+        `${existed ? "Updated" : "Created"} ${rel} (schema 1.2); ${intentNote}${humanNote}; ${commitNote}.` +
         (issues.length ? ` Intent issues (informational): ${issues.join("; ")}` : ""),
     };
   }
@@ -1548,13 +1585,20 @@ export class SandboxToolExecutor {
     const hasPyTests =
       has("pytest.ini") || has("pyproject.toml") || entries.some((f) => /^test_.+\.py$|_test\.py$/.test(f));
     if (has("requirements.txt") || hasPyTests) {
+      // Prefer a repo virtualenv over the PATH interpreter: a system python3
+      // (Homebrew/PEP 668) refuses `pip install`, which would poison the run
+      // with a dependency failure instead of a test verdict. Checked in the
+      // test dir first, then the sandbox root.
+      const python =
+        [resolve(cwd, ".venv/bin/python3"), resolve(this.root, ".venv/bin/python3")].find((p) => existsSync(p)) ??
+        "python3";
       const log: string[] = [];
       if (has("requirements.txt")) {
-        const i = this.sh("python3", ["-m", "pip", "install", "-q", "-r", "requirements.txt"], cwd);
+        const i = this.sh(python, ["-m", "pip", "install", "-q", "-r", "requirements.txt"], cwd);
         if (i.code !== 0) log.push(`[deps] pip install -r requirements.txt exited ${i.code}:\n${i.out.slice(-1200)}`);
       }
-      this.sh("python3", ["-m", "pip", "install", "-q", "pytest"], cwd);
-      const t = this.sh("python3", ["-m", "pytest", "-q"], cwd);
+      this.sh(python, ["-m", "pip", "install", "-q", "pytest"], cwd);
+      const t = this.sh(python, ["-m", "pytest", "-q"], cwd);
       const body = `${log.join("\n")}\n$ python3 -m pytest -q (in ${where})\n${t.out}`.trim();
       // pytest exit 5 = "no tests were collected": a missing suite, not a red one.
       if (t.code === 5) {
@@ -1635,7 +1679,7 @@ export class SandboxToolExecutor {
       // skips ALL workflows on the agent commit, not just AutoFactory — acceptable
       // because the agents already run tests in-chain and the human's own pushes
       // (and the post-merge deploy) still trigger CI normally.
-      const ciSafeMessage = /\[(skip ci|ci skip)\]/i.test(message) ? message : `${message}\n\n[skip ci]`;
+      const ciSafeMessage = !this.skipCi || /\[(skip ci|ci skip)\]/i.test(message) ? message : `${message}\n\n[skip ci]`;
       this.runGit(["commit", "-m", ciSafeMessage]);
       const branch = this.prBranch ?? process.env.PR_BRANCH;
       this.runGit(branch ? ["push", "origin", `HEAD:${branch}`] : ["push"]);

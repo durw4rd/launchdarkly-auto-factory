@@ -4,6 +4,7 @@ export * from "./types.js";
 export * from "./env.js";
 export * from "./config.js";
 export * from "./ldClient.js";
+export * from "./maintainer.js";
 export * from "./releaseAdapter.js";
 export * from "./releaseIntent.js";
 export * from "./configVersion.js";
@@ -39,6 +40,9 @@ export * from "./anthropic/anthropicAgentRunner.js";
 // Bedrock provider: the Anthropic runner's tool loop over the Bedrock Mantle
 // transport (same Messages API, AWS auth/billing).
 export * from "./bedrock/bedrockAgentRunner.js";
+// OpenAI provider: the same agent contract on Chat Completions function
+// calling — the Codex surface's execution backend (ADR 0018).
+export * from "./openai/openaiAgentRunner.js";
 export * from "./cursor/cursorModel.js";
 export * from "./cursor/cursorAgentRunner.js";
 export * from "./observability.js";
@@ -51,7 +55,11 @@ export * from "./judgeEvidence.js";
 export * from "./anthropic/judgeCompletion.js";
 export * from "./bedrock/judgeCompletion.js";
 export * from "./cursor/judgeCompletion.js";
+export * from "./openai/judgeCompletion.js";
 // Knowledge graph (ADR 0010): LD-native composition + agent queries.
 export * from "./graph/index.js";
 // Cross-repo research for split-repo estates (query_related_repos).
 export * from "./github/relatedRepos.js";
+export * from "./github/intake.js";
+// Jev (TypeSafe AI) pre-classification: optional, on with TYPESAFE_API_KEY.
+export * from "./jev/index.js";

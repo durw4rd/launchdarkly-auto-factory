@@ -1,0 +1,115 @@
+{
+  "key": "autofactory-jev-preclassifier",
+  "name": "AutoFactory Jev Pre-classifier",
+  "description": "Question set for the optional Jev (TypeSafe AI) pre-classification layer. Each variation holds its questions in model.custom.questions and the prefill confidence bar in model.parameters.minPrefillConfidence. The question NAMES are the contract with the runtime (it reads answers by name); reword or drop questions freely, but keep the names. Messages are unused: Jev has no chat turns, its input is the diff. Only runs when TYPESAFE_API_KEY is set; the auto-factory-jev-mode flag picks shadow or prefill.",
+  "mode": "completion",
+  "tags": [
+    "auto-factory",
+    "jev"
+  ],
+  "variations": [
+    {
+      "key": "default",
+      "name": "Default",
+      "modelConfigKey": "TypeSafe.jev-latest",
+      "model": {
+        "modelName": "jev-latest",
+        "parameters": {
+          "minPrefillConfidence": 0.7
+        },
+        "custom": {
+          "questions": {
+            "risk": {
+              "type": "score",
+              "instructions": "How risky is this change to ship? Score the blast radius of the behavior change, not the line count. Any change to what a customer is charged or shown as a price is at least Moderate.",
+              "criteria": [
+                "Trivial: docs, tests, comments, or formatting only; no runtime behavior change",
+                "Low: small additive, isolated change (new endpoint, copy change) with a narrow blast radius",
+                "Moderate: modified business logic or shared code with a moderate blast radius",
+                "High: cross-cutting change, API contract change, or data migration",
+                "Critical: touches auth, payments, pricing/totals, or data integrity"
+              ]
+            },
+            "flag_worthy": {
+              "type": "noul",
+              "instructions": "Can the behavior this change introduces or modifies be gated at runtime with a LaunchDarkly feature flag, where it is not already gated? Do not judge whether gating is worthwhile — only whether it is technically possible and not yet done.",
+              "criteria": {
+                "true": "Yes: the change alters code that runs in production (UI, API endpoints, business logic, runtime configuration reads) and no existing flag evaluation already wraps that changed code",
+                "false": "No: nothing gateable changed (only docs, comments, tests, CI/build files, or dependency manifests), or every changed runtime path is already wrapped by an existing flag evaluation"
+              }
+            },
+            "pr_type": {
+              "type": "choice",
+              "instructions": "What kind of change is this?",
+              "criteria": {
+                "feature": "Adds new functionality or behavior",
+                "bugfix": "Fixes incorrect existing behavior",
+                "refactor": "Restructures code without changing behavior",
+                "config_change": "Changes configuration values only",
+                "dependency_update": "Bumps or changes dependencies",
+                "infrastructure": "Build, CI, deployment, or infrastructure code",
+                "test_only": "Adds or changes tests only",
+                "documentation": "Docs or comments only"
+              }
+            },
+            "flag_type": {
+              "type": "choice",
+              "instructions": "If this change is flagged, which kind of flag fits it?",
+              "criteria": {
+                "release": "Temporary flag to roll out new or changed behavior, removed after full release",
+                "kill_switch": "Permanent off-switch for a risky or expensive subsystem",
+                "experiment": "A/B test of alternatives measured against a business metric",
+                "operational": "Long-lived operational control or tuning (limits, timeouts, modes)"
+              }
+            },
+            "flag_action": {
+              "type": "choice",
+              "instructions": "Which flag action fits this change? Decide mechanically from the diff: look for existing flag evaluations around the changed code. Do not judge whether a flag is worthwhile.",
+              "criteria": {
+                "create": "The change alters runtime behavior and no existing flag evaluation wraps the changed code: create a fresh flag",
+                "ride_existing": "An existing flag evaluation wraps the changed code and the change iterates on that flagged path",
+                "extend_variation": "An existing multivariate flag wraps the changed code and the change adds a new alternative to it: add the next variation",
+                "child_flag": "The change adds new functionality inside or next to code already wrapped by a flag: create a new flag with the existing one as a prerequisite",
+                "none": "Nothing in the change runs at runtime (only docs, comments, tests, CI/build files, or dependency manifests)"
+              }
+            },
+            "feature_novelty": {
+              "type": "choice",
+              "instructions": "Is the behavior this change introduces a new path or a change to an existing one?",
+              "criteria": {
+                "net_new": "A new path (new endpoint or component) that users without the change never exercise",
+                "incremental": "A change to an existing path that both old and new behavior exercise",
+                "mixed": "Some surfaces are new, others are changed existing paths"
+              }
+            },
+            "metric_backing": {
+              "type": "choice",
+              "instructions": "How should a guardrail metric for this change be measured, given the telemetry visible in the code?",
+              "criteria": {
+                "reuse_event": "The code already sends an analytics/track event that measures the affected behavior",
+                "reuse_traces": "The affected code is already covered by tracing spans that can back a metric",
+                "ride_o11y": "An observability SDK is installed; enabling its instrumentation covers the behavior without new events",
+                "instrument_track": "Nothing measures this yet; a new track() event must be added"
+              }
+            },
+            "release_method": {
+              "type": "choice",
+              "instructions": "How should this change be released once merged?",
+              "criteria": {
+                "immediate": "Turn it on for everyone at once; low risk and nothing meaningful to measure",
+                "progressive": "Ramp it up in stages over time without metric-based automatic rollback",
+                "guarded": "Ramp it up while monitoring metrics, rolling back automatically on a regression"
+              }
+            }
+          }
+        }
+      },
+      "messages": [
+        {
+          "role": "system",
+          "content": "Documentation only (not sent to Jev). Pre-classify a code change for the AutoFactory release pipeline before the agents run: risk, flag-worthiness, change type, flag type and action, feature novelty, metric backing, and release method. Jev reads the PR title, description, changed files, and diff as its state and answers the typed questions in model.custom.questions."
+        }
+      ]
+    }
+  ]
+}

@@ -15,6 +15,264 @@ Status legend: ✅ done · 🔜 planned/in progress
 
 ---
 
+## 2026-09-28 (Jev pre-classification, optional layer)
+
+### ✅ `autofactory-jev-preclassifier/default`: flag questions are mechanical, not judgment calls
+- `flag_worthy` now asks whether the changed runtime behavior *can* be gated by a
+  LaunchDarkly flag and isn't already, not whether it *should* be. `flag_action`'s
+  `none` option now means "nothing in the change runs at runtime", replacing "not
+  flag-worthy at all". Why: the pipeline's policy is to flag nearly everything that
+  can be flagged, and "worthwhile" takes business context Jev doesn't have.
+- Trigger: on app PR #28 (gift guide) the old wording gave `flag_action=none@0.85`,
+  which cleared the prefill bar and was injected into the planner's prompt.
+- Side-by-side on five real app-repo changes:
+  - gift guide: flag_action none@0.61 → create@0.95
+  - loyalty points: none@0.82 → create@0.98, flag_worthy 0.66 → 0.96
+  - docs-only and CI-only changes: still not flaggable, at ≥0.94
+  - the already-flagged sort-by merge commit: now reads "already gated"
+- Edited live (PATCH + modelConfigKey re-assert), plus the code fallback and this
+  seed.
+
+### ✅ New AI config `autofactory-jev-preclassifier` + custom model config `TypeSafe.jev-latest`
+- Completion-mode config holding the Jev question set, so wording can be edited and
+  A/B-tested in LaunchDarkly instead of in code. The `default` variation points at the
+  new custom model config `TypeSafe.jev-latest` (id `jev-latest`, provider TypeSafe,
+  input cost $42 per billion tokens), with the questions in `model.custom.questions`
+  and the prefill bar in `model.parameters.minPrefillConfidence` (0.7).
+- Question names are the runtime contract. Variations may reword or drop questions,
+  but must keep the names. Messages are documentation only.
+- Runtime: the tracker records duration, tokens, and success/error per variation. A
+  numeric `autofactory-jev-agreement` event (share of compared decisions where Jev
+  matched the agents, with the variation's track data) can back a metric for
+  experiments on question wording.
+- Falls back to the built-in questions when the config is missing, disabled, or
+  malformed.
+- Provisioned live via `bridge upgrade`, which now also creates custom model configs
+  from `config/agentcontrol/model-configs/`. Also fixed: upgrade compared `messages`
+  by raw JSON, so a `{role, content}` vs LD's `{content, role}` key order re-PATCHed
+  the config on every run.
+
+### ✅ New operational flag `auto-factory-jev-mode` (off / shadow / prefill)
+- Controls the optional Jev (TypeSafe AI) pre-classifier. It only takes effect when
+  `TYPESAFE_API_KEY` is set; with a key and no flag provisioned yet, runs default to
+  **shadow**.
+- Before the chain runs, one Jev request answers: risk_score, flag_worthy,
+  pr_type (→ skip_flagging), flag_type, flag_action, feature_novelty,
+  metric_backing, release_method, plus one yes/no per existing app-project metric.
+- **shadow**: after the walk, the answers are compared with the agents' tags and the
+  planner's prose, printed as a table (CLI summary, collapsed in the PR comment), and
+  emitted as the `autofactory-jev-preclassification` custom event.
+- **prefill**: shadow, plus answers with confidence ≥ 0.7 go into the entry node's
+  prompt as evidence. Tags are never seeded, so routing and approval gates are
+  unchanged in every mode.
+- Provisioned live with targeting OFF, which serves `off`. Turn targeting on (serves
+  `shadow`) to enable the layer. The shadow default applies only when the flag
+  doesn't exist at all.
+
+## 2026-09-04 (issue intake entry point — ADR 0019)
+
+### ✅ New AI config `autofactory-issue-coder` (step 0, intake)
+- **Change:** Added the Issue Coder agent: implements a GitHub issue on a fresh
+  branch (`autofactory/issue-<n>`) with tests, `run_tests`, `commit_and_push`,
+  then a PR-ready summary. Tools: the read-only set + `write_file`/`edit_file`/
+  `run_tests`/`commit_and_push`/`read_ld_docs`/`query_related_repos`. NO flag,
+  metric, or manifest tools — the PR it produces goes through the regular chain,
+  which owns those. Informational tags `code_changed`, `tests_run` (not routed;
+  the CLI verifies the push from git, not from tags). Default model
+  `Anthropic.claude-sonnet-4-6`; no judges yet.
+- **Why:** Extend the factory "left" of the PR so the coding step's tokens,
+  model, and configuration are recorded by AgentControl and joinable to the PR,
+  the flag, and the release outcome (cost per issue; config vs. regressions).
+
+### ✅ `gha-auto-factory`: re-rooted on the intake node
+- **Change:** `rootConfigKey` → `autofactory-issue-coder`; new first edge
+  `autofactory-issue-coder → autofactory-research-planner` with
+  `handoff.intake: true` (plus the planner's usual capability grant, for
+  documentation — the edge is never traversed in-process). All other edges
+  unchanged.
+- **Why:** The LaunchDarkly AI SDK disables a graph whose nodes aren't all
+  reachable from the root, so an optional entry point must BE the root. The
+  walker's default entry (`defaultEntryNode`) skips past intake nodes, so every
+  PR-triggered run (Action, extension, `autofactory run`) still starts at the
+  research planner with no behavior change; `autofactory intake --issue <n>`
+  starts at the coder and stops after it. The intake run's commits carry no
+  `[skip ci]` so the PR it opens triggers the regular chain.
+- **Runtime:** ships with the walker change (`startAt`/`stopAfter`, intake-aware
+  default entry) — provision the graph only AFTER deploying the code that
+  understands `handoff.intake` (the action bundle is rebuilt in the same commit).
+- **Join keys:** both runs stamp `ticket` (`issue-<n>`), `repo`, and `entry`
+  (`issue` | `pr`) on the `run` context; the PR-triggered run also stamps `pr`
+  and `intake_run`, read from the intent marker in the PR body, and defaults
+  `TICKET_ID` to the intent — so the implementer's `{{TICKET_ID}}` flag tag
+  now carries the issue id automatically.
+
+---
+
+## 2026-08-27 (Copilot cloud agent surface)
+
+### ✅ `auto-factory-ai-provider`: `copilot` surface rule (production + test)
+- **Change:** Added a targeting rule `run.surface in ["copilot"] → anthropic` to both
+  environments (live PATCH + the committed flag definition), ahead of the GitHub Action
+  50/50 rule. Front end #6 (Copilot cloud agent, `bootstrap/copilot/`) stamps
+  `AUTOFACTORY_SURFACE=copilot`; the chain runs inside Copilot's Actions-based sandbox
+  in working-tree mode, which requires a sandbox-confined runner — hence Anthropic, not
+  a Copilot-native provider (a Copilot SDK runner is a planned follow-up, same seam as
+  ADR 0006/0018).
+- **Why:** ADR 0018 puts surface→provider routing in flag targeting, not code — adding a
+  front end must not need a core change, and it didn't: no new provider, no new
+  variation, one rule.
+
+
+## 2026-08-26 (implementer W-rules + planner money-path risk floor)
+
+### ✅ `autofactory-flag-implementer`: variation-wiring mechanics (W01–W04)
+
+- **New "Wiring the variation (MANDATORY mechanics)" section** (default + openai
+  via copyFrom; live via `bridge upgrade`): W01 exact quoted string comparison
+  to the target variation (the `variation-wired-in-code` ⛔ re-derives this);
+  W02 boolean-helper trap — never evaluate a multivariate flag through
+  `is_enabled`/`useFlag`/`bool(variation(...))`; W03 extend a boolean-only
+  helper module with a variation-returning function mirroring its conventions;
+  W04 the lookup's fallback must be `"control"`. Driven by two identical live
+  ⛔ failures (claude-sonnet-4-6 on the React `useFlag` helper 2026-08-26 AM,
+  gpt-5.2 on the FastAPI `flags.is_enabled` helper 2026-08-26 PM) — the repo's
+  boolean convention beat the instructions on both providers.
+
+### ✅ `autofactory-research-planner`: money-path risk HARD FLOOR
+
+- Risk anchors extended: any change altering what a customer is charged or
+  shown as a price (pricing rules, discounts, totals math, checkout behavior)
+  is **at minimum ~0.5 and flag-worthy**, even when small and additive; score
+  blast radius, not line count. Driven by a live gpt-5.2 run scoring an
+  unconditional 10%-off-$150+ checkout discount `risk_score 0.2,
+  flag_worthy false` (a second run scored the same diff 0.55 — high variance).
+
+## 2026-08-26 (surface-aware provider routing + OpenAI variations, ADR 0018)
+
+### ✅ `auto-factory-ai-provider`: surface rules + `openai` variation
+
+- **New variation `openai`** (agents on OpenAI Chat Completions;
+  `OPENAI_API_KEY`/`CODEX_API_KEY`). **New committed `targeting` block**
+  (applied on create by provision; live project PATCHed the same day): flag ON,
+  rules on `run.surface` — `claude-code` → anthropic, `codex` → openai,
+  `github-action` → **50/50 anthropic/cursor rollout bucketed by run key**;
+  fallthrough anthropic. Surfaces stamp `AUTOFACTORY_SURFACE` (skills, GHA
+  workflow env, CLI default `cli`). Replaces the earlier 40/40/20 per-agent
+  model A/B with a run-level provider split. Runners fall back to anthropic
+  when the selected provider's key is absent.
+
+### ✅ All 8 AI configs: `openai` variation + provider-routing rule
+
+- Every agent config gains variation **`openai`** = `OpenAI.gpt-5.2` (judges:
+  `OpenAI.gpt-5-mini`), instructions/tools **copied from `default` via the new
+  committed `copyFrom` field** (one source of truth, no duplicated instruction
+  blocks). New committed `targeting` rule: `run.provider in ["openai"]` →
+  serve the `openai` variation (applied on create; live project PATCHed).
+  Registry note: LD's global model catalog has base gpt-5.x keys but no
+  `-codex` variants (probed live 2026-08-26).
+
+## 2026-08-21 (observability-first metric backing + M14 human-input pause)
+
+### ✅ `autofactory-metrics-author`: Metric Backing priority rewritten (ADR 0017)
+
+- **Change (default + sentry variations, committed + live via `bridge upgrade`):**
+  decision order per category is now (1) **reuse existing data** — an existing
+  `track()` event, OR existing spans with attribution + delivery already verified
+  (defining a trace metric on them is code-free); (2) **ride the installed
+  observability stack** — LD o11y SDK (direct export, no delivery validation) or
+  generic OTel with the LD evaluation hook registered (hook-adding is encouraged,
+  code changes and all); (3) **instrument a new `track()` call** — the floor, and
+  the only backing when no telemetry stack exists. Installing a new o11y/OTel
+  package stays forbidden (M10) — ride what's there, record the gap.
+- **Trace metrics are no longer LD-o11y-only:** valid under ATTRIBUTION (an LD
+  evaluation hook — o11y plugin or the standalone OTel tracing hook — enriches
+  spans in the trace evaluating this flag) + DELIVERY (traces demonstrably reach
+  LaunchDarkly; `query_dependencies` edges are the evidence — hook presence in
+  code proves attribution, never delivery). Pre-aggregated OTel **metrics**
+  remain banned; the ban no longer smears onto span-level traces.
+- **M10 rewritten (footprint ≠ guardrail):** span coverage + flag attribution
+  wherever a telemetry stack exists, regardless of which backing gates the
+  release; hook/exporter init must degrade to a no-op, never crash startup.
+- **New M14 (pause and ask):** first-time hook wiring in a generic-OTel service
+  with unverifiable delivery → the agent STOPS before any instrumentation,
+  writes `humanInput.question` into the manifest, tags `needs_human_input=true`
+  + `human_question`, and the walker halts (`WalkResult.pendingInput`). The
+  human answers in the manifest's `humanInput.answer` (agent-unwritable,
+  structurally protected in `write_manifest`) and re-runs; the fresh walk finds
+  the answer and completes. Surfaces: CLI exit 4, PR comment +
+  `action_required` check run, editor toast. Same manifest-as-human-channel
+  pattern as releaseIntent (ADR 0009).
+- **Docs list extended:** `sdk/features/opentelemetry-server-side` /
+  `-client-side`, `sdk/features/observability-otel-collector`,
+  `home/metrics/autogen/opentelemetry`.
+- **Live A/B arms re-synced:** `composer-2-5` and `fable-5` had drifted (stale
+  pre-ADR-0013 M01 wording); PATCHed to the new default instructions so arms
+  again differ only by model. `vega-chain-copy` left untouched (preserved
+  legacy).
+- **Why:** the old rules conflated "pre-aggregated OTel metrics can't back a
+  guarded release" (true) with "only the LD o11y package can back trace
+  metrics" (false — the SDK hooks attribute spans in any OTel estate), and
+  framed track() as the default rather than the floor, under-investing in
+  estate-wide telemetry. The pause exists so an unverifiable trace guardrail is
+  never shipped as a silent no-op — surfacing to a human beats both guessing
+  and silently downgrading.
+
+### ✅ `autofactory-research-planner`: telemetry_inventory in the brief
+
+- Repo Conventions now require a `telemetry_inventory` (o11y packages, LD hooks
+  wired, track() calls, span coverage, `ld_trace_delivery`
+  verified/unverified/unknown via `query_dependencies`, advisory
+  `recommended_backing`). Evidence, not routing: the metrics author verifies it
+  and may override with a note. Per-telemetry-type config VARIATIONS were
+  considered and rejected (the decision needs checkout facts the deciding step
+  must verify anyway; near-identical instruction copies multiply maintenance).
+
+### ✅ Tags + tools + runtime
+
+- New registry tags `needs_human_input` (routing: halts the walker) and
+  `human_question` (informational: surfaced by front ends); README table +
+  check-configs updated.
+- `write_manifest` tool: new `humanInput` block — agents may set/update
+  `question`; `answer` is human-owned and survives every agent write (mirror of
+  the releaseIntent protection). Tool description updated (committed +
+  exported + live).
+- `create_metric` tool description updated for the two-condition trace-backing
+  rule; trimmed to LD's 1024-BYTE description limit (em dashes count as 3 —
+  discovered live when the upgrade 400'd at 1017 chars/1029 bytes).
+- Runtime (code repo, same commit): `WalkResult.pendingInput` +
+  `awaiting-input` walk event; CLI exit code 4 + resume message; Action PR
+  comment + `action_required` check; extension toast; Claude Code skill exit-4
+  contract. Graph-level metrics are suppressed on the pause (like approval
+  pauses — the post-answer re-run reports the complete invocation).
+
+## 2026-08-18 (provider-aware routing on flag-testing)
+
+### ✅ `autofactory-flag-testing`: run.provider rules added around the composer-2-5 arm
+
+- **Why:** on 2026-08-13 a `composer-2-5` A/B arm was added to this config
+  (live, via API — not by the bridge) with a naked 50/50 `default`/`composer-2-5`
+  fallthrough rollout and NO `run.provider` rules. Composer only runs on the
+  Cursor provider, so any run bucketed to the anthropic provider AND the
+  composer arm passed `composer-2.5` to the Anthropic API and failed the node
+  with a 404 `not_found_error` — deterministically, ~25% of runs. Observed
+  live: demo PRs #238 and #240 (2026-08-18) failed flag-testing this way,
+  driving the graph invocation-failure rate to 75% that day.
+- **Change (production targeting, via API):** mirrored the 2026-07-20
+  provider-aware pattern from `autofactory-flag-implementer` /
+  `autofactory-metrics-author` — rule `run.provider = cursor` → 50/50
+  `default` / `composer-2-5`; rule `run.provider = anthropic` → 100%
+  `default` (this config has no fable arm); fallthrough → 100% `default`
+  (safe for runtimes that don't stamp `run.provider`).
+- **⚠ Known drift, not fixed here:** the `composer-2-5` variation's
+  instructions are STALE (pre-ADR-0013: boolean flag-on/flag-off language, no
+  T14, no string-multivariate T01, no run_tests scaffolding paragraph), so the
+  arm differs from `default` by more than model. Re-sync by hand before
+  reading the A/B as a model comparison. There is also a `hello-test`
+  connectivity-test variation (weight 0 everywhere) from the same 2026-08-13
+  session that can be deleted.
+
+---
+
 ## 2026-08-12 (raise runaway backstops)
 
 ### ✅ `gha-auto-factory`: all edge `max_turns` → 100

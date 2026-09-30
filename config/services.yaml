@@ -14,6 +14,21 @@
 # This generalizes the reference (which hardcoded specific service names).
 
 services:
+  # --- DarkCommerce checkout demo (factory-ecom-example), run locally. ---
+  # One fullstack Next.js app registered as both sides so fullstack-scoped
+  # manifests pass the cross-service check against its own deployed SHA.
+  checkout-demo:
+    side: frontend
+    repo: gyeutter-launchdarkly/factory-ecom-example
+    statusUrl: http://127.0.0.1:3109/api/status
+    statusShaField: version
+
+  checkout-demo-api:
+    side: backend
+    repo: gyeutter-launchdarkly/factory-ecom-example
+    statusUrl: http://127.0.0.1:3109/api/status
+    statusShaField: version
+
   demo-frontend:
     side: frontend
     repo: ttotenberg-ld/launchdarkly-autofactory-demo

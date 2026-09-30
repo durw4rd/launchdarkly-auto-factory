@@ -1,9 +1,25 @@
 {
   "key": "gha-auto-factory",
   "name": "GHA AutoFactory",
-  "description": "Agent graph that represents the chain of agents in the GHA version of AutoFactory",
-  "rootConfigKey": "autofactory-research-planner",
+  "description": "Agent graph that represents the chain of agents in the GHA version of AutoFactory Root = the INTAKE entry point (issue coder, ADR 0019): PR-triggered runs enter at the research planner (the intake edge is marked handoff.intake=true); `autofactory intake --issue <n>` runs the coder alone and hands off via the PR it opens.",
+  "rootConfigKey": "autofactory-issue-coder",
   "edges": [
+    {
+      "key": "edge-autofactory-issue-coder-autofactory-research-planner",
+      "sourceConfig": "autofactory-issue-coder",
+      "targetConfig": "autofactory-research-planner",
+      "handoff": {
+        "intake": true,
+        "max_turns": 100,
+        "request_type": "Fix",
+        "capabilities": [
+          "flag_state",
+          "write_manifest",
+          "query_graph",
+          "query_repos"
+        ]
+      }
+    },
     {
       "key": "edge-autofactory-research-planner-autofactory-manifest-steward",
       "sourceConfig": "autofactory-research-planner",

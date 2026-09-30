@@ -135,6 +135,24 @@ export function withProvider(context: LDContext, provider: string): LDContext {
 }
 
 /**
+ * Return a copy of the pipeline context with extra attributes on the `run`
+ * kind — the join keys that let a run's agent telemetry be tied to the work it
+ * did: `ticket` (issue / intent id), `pr`, `repo`, `entry` (issue | pr). Never
+ * touches `key` (bucketing), drops empty values, and passes non-multi contexts
+ * through unchanged. Additive: projects with no rules on these attributes
+ * fall through exactly as before.
+ */
+export function withRunAttributes(context: LDContext, attrs: Record<string, unknown>): LDContext {
+  const multi = context as { kind?: string; run?: Record<string, unknown> };
+  if (multi.kind !== "multi" || !multi.run) return context;
+  const clean = Object.fromEntries(
+    Object.entries(attrs).filter(([k, v]) => k !== "key" && v !== undefined && v !== null && v !== ""),
+  );
+  if (Object.keys(clean).length === 0) return context;
+  return { ...multi, run: { ...multi.run, ...clean } } as unknown as LDContext;
+}
+
+/**
  * The LaunchDarkly targeting context for a pipeline run. A MULTI-context:
  *
  *  - `service` (static): stable across runs — flag evaluation, env scoping, and
@@ -151,13 +169,21 @@ export function withProvider(context: LDContext, provider: string): LDContext {
  */
 export function pipelineContext(extra: Record<string, unknown> = {}): LDContext {
   currentRunId = randomUUID();
+  // The SURFACE the run was launched from (claude-code | codex | github-action
+  // | extension | cli | …), from AUTOFACTORY_SURFACE — each front end sets it
+  // (the skills on their command line, the Action in its workflow env). The
+  // provider flag's rules key on `run.surface` to pick the execution backend
+  // per surface; the 50/50 GHA rollout buckets by the run key. Absent env →
+  // no attribute → surface rules don't match and the fallthrough serves.
+  const surface = process.env.AUTOFACTORY_SURFACE?.trim();
   return {
     kind: "multi",
     service: {
       key: process.env.LD_PIPELINE_CONTEXT_KEY ?? "auto-factory-phase1",
       name: "AutoFactory Phase 1",
+      ...(surface ? { surface } : {}),
       ...extra,
     },
-    run: { key: currentRunId },
+    run: { key: currentRunId, ...(surface ? { surface } : {}) },
   } as LDContext;
 }

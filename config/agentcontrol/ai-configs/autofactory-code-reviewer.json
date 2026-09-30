@@ -21,6 +21,30 @@
         "tag_conversation",
         "read_ld_docs"
       ]
+    },
+    {
+      "key": "openai",
+      "name": "OpenAI (gpt-5.2)",
+      "modelConfigKey": "OpenAI.gpt-5.2",
+      "copyFrom": "default"
     }
-  ]
+  ],
+  "targeting": {
+    "rules": [
+      {
+        "description": "OpenAI runs → OpenAI model variation",
+        "clauses": [
+          {
+            "contextKind": "run",
+            "attribute": "provider",
+            "op": "in",
+            "values": [
+              "openai"
+            ]
+          }
+        ],
+        "variation": "openai"
+      }
+    ]
+  }
 }

@@ -31,6 +31,7 @@ import {
   LdResourceWriter,
   type ResumeInput,
   type LoopGrant,
+  OpenAiAgentRunner,
   type StallInfo,
   appConnection,
   assembleKnowledgeGraph,
@@ -44,6 +45,7 @@ import {
   createAnthropicJudgeCompletion,
   createBedrockJudgeCompletion,
   createJudgeHook,
+  createOpenAiJudgeCompletion,
   createPolicyGate,
   createWorkingTreeEvidence,
   decideApproval,
@@ -51,6 +53,7 @@ import {
   describeLoopEdgeShadowed,
   describeLoopExhausted,
   extractConfigStamp,
+  finishJevLayer,
   getLdSdk,
   hasChangeToProcess,
   initFactorySentry,
@@ -58,11 +61,14 @@ import {
   isGitRepo,
   loadDotEnv,
   loadRelatedRepos,
+  localMaintainerEmail,
   normalizeReleaseIntent,
   pipelineContext,
   readRepoState,
   resolveAiProvider,
   resolveApprovalPolicy,
+  resolveMaintainerId,
+  startJevLayer,
   targetConnection,
   walkGraph,
   withProvider,
@@ -83,6 +89,23 @@ import {
 } from "./walkState.js";
 import { type RunOutcome, deriveOutcome, writeRunRecord } from "./runRecord.js";
 
+/**
+ * What a pause message may claim was created. On a first pass the paused step
+ * (and everything after it) created nothing; once a loop has re-run a node, an
+ * earlier iteration may already have created the flag/metrics — say so.
+ */
+function createdSoFar(
+  walk: { runs: { iteration: number }[]; inventory: Record<string, string> },
+  firstPass: string,
+): string {
+  const created = [
+    walk.inventory.flag_key ? `flag '${walk.inventory.flag_key}'` : "",
+    walk.inventory.metric_keys ? `metric(s) '${walk.inventory.metric_keys}'` : "",
+  ].filter(Boolean);
+  if (!walk.runs.some((r) => r.iteration > 1) || !created.length) return firstPass;
+  return `A prior iteration already created ${created.join(" and ")}; nothing new was created on this pass.`;
+}
+
 function appBaseUrl(): string {
   return (process.env.LD_BASE_URL || "https://app.launchdarkly.com").replace(/\/+$/, "");
 }
@@ -94,7 +117,7 @@ function metricUrl(project: string, metricKey: string): string {
 }
 
 /** A writer for real flag/metric creation in the app project, or undefined (dry run). */
-function buildWriter(dryRun: boolean): LdResourceWriter | undefined {
+async function buildWriter(dryRun: boolean, root: string): Promise<LdResourceWriter | undefined> {
   if (dryRun) return undefined;
   if (!process.env.LD_API_KEY) {
     throw new UsageError("LD_API_KEY is not set (required to create flags/metrics; use --dry-run for read-only)");
@@ -106,7 +129,21 @@ function buildWriter(dryRun: boolean): LdResourceWriter | undefined {
       "LD_APP_PROJECT_KEY is not set — refusing to create flags in the factory project (use --dry-run for read-only)",
     );
   }
-  return new LdResourceWriter(new LdClient(appConnection()));
+  const ld = new LdClient(appConnection());
+  // Local runs attribute created flags to the developer, not the API token's
+  // owner: AUTOFACTORY_MAINTAINER_EMAIL, else the target repo's git identity.
+  // Fail-open — an unresolvable email keeps today's token-owner default.
+  const email = localMaintainerEmail(root);
+  let maintainerId: string | undefined;
+  if (email) {
+    maintainerId = await resolveMaintainerId(ld, email);
+    if (maintainerId) {
+      console.log(`Flag maintainer: ${email}.`);
+    } else {
+      console.log(`⚠ flag maintainer: no LaunchDarkly member matches '${email}' — new flags default to the API token's owner`);
+    }
+  }
+  return new LdResourceWriter(ld, maintainerId ? { maintainerId } : {});
 }
 
 
@@ -158,6 +195,7 @@ async function detectConfigDrift(graphKey: string): Promise<string | undefined> 
  * keys (renamed agents, custom graphs) fall back to the key itself.
  */
 const NODE_TITLES: Record<string, string> = {
+  "autofactory-issue-coder": "Implement issue",
   "autofactory-research-planner": "Research & plan",
   "autofactory-flag-implementer": "Flag implementation",
   "autofactory-metrics-author": "Metrics & instrumentation",
@@ -166,12 +204,12 @@ const NODE_TITLES: Record<string, string> = {
   "autofactory-code-reviewer": "Code review",
 };
 
-function nodeTitle(configKey: string): string {
+export function nodeTitle(configKey: string): string {
   const t = NODE_TITLES[configKey];
   return t ? `${t} (${configKey})` : configKey;
 }
 
-function describeStall(stall: StallInfo): string {
+export function describeStall(stall: StallInfo): string {
   const edges = stall.unmet
     .map((u) => `edge → ${u.target} requires ${Object.entries(u.requireMissing).map(([k, v]) => `${k}=${v}`).join(", ")} (never produced)`)
     .join("; ");
@@ -215,19 +253,24 @@ async function run(opts: CliOptions): Promise<number> {
   }
 
   const { ldClient, aiClient } = await getLdSdk();
+  // Surface for provider-flag targeting (ADR 0018): skills/workflows set
+  // AUTOFACTORY_SURFACE (claude-code | codex | github-action); a bare
+  // terminal run defaults to "cli".
+  process.env.AUTOFACTORY_SURFACE ||= "cli";
   let ldContext = pipelineContext();
+  console.log(`Surface: ${process.env.AUTOFACTORY_SURFACE}`);
 
-  // The CLI runs on the SANDBOXED runners only (Anthropic or Bedrock — the
-  // same tool loop over different transports). Vega executes agents
-  // server-side, so it can't edit this working tree. Cursor executes locally
-  // BUT its local agent carries native shell/git tools alongside our sandbox
-  // tools — in a live run (2026-07-20) it committed each step and pushed the
-  // branch itself, bypassing commit_and_push (the only place gitMode
-  // "workingTree" is enforced), and the SDK offers no tool-restriction API to
-  // prevent it. Only the sandbox-confined runners satisfy the CLI's "nothing
-  // is committed or pushed" contract.
+  // The CLI runs on the SANDBOXED runners only (Anthropic, Bedrock, or OpenAI
+  // — tool-loop runners whose only hands are our sandbox tools). Vega executes
+  // agents server-side, so it can't edit this working tree. Cursor executes
+  // locally BUT its local agent carries native shell/git tools alongside our
+  // sandbox tools — in a live run (2026-07-20) it committed each step and
+  // pushed the branch itself, bypassing commit_and_push (the only place
+  // gitMode "workingTree" is enforced), and the SDK offers no tool-restriction
+  // API to prevent it. Only the sandbox-confined runners satisfy the CLI's
+  // "nothing is committed or pushed" contract.
   let provider = await resolveAiProvider(ldClient, ldContext);
-  if (provider !== "anthropic" && provider !== "bedrock") {
+  if (provider !== "anthropic" && provider !== "bedrock" && provider !== "openai") {
     console.log(
       `Provider flag selects '${provider}', but the CLI's working-tree mode requires a sandboxed runner ` +
         `(${provider === "cursor" ? "Cursor local agents have native git and would commit/push" : "Vega runs server-side"}). Using Anthropic.`,
@@ -236,6 +279,9 @@ async function run(opts: CliOptions): Promise<number> {
   }
   if (provider === "anthropic" && !process.env.ANTHROPIC_API_KEY) {
     throw new UsageError("ANTHROPIC_API_KEY is not set (required on the Anthropic runner)");
+  }
+  if (provider === "openai" && !process.env.OPENAI_API_KEY && !process.env.CODEX_API_KEY) {
+    throw new UsageError("OPENAI_API_KEY (or CODEX_API_KEY) is not set (required on the OpenAI runner)");
   }
   // Stamp the EFFECTIVE provider (anthropic or bedrock here) on the run context
   // so AI config targeting serves only models this runner can execute (rules on
@@ -307,7 +353,7 @@ async function run(opts: CliOptions): Promise<number> {
     );
   }
 
-  const writer = buildWriter(opts.dryRun);
+  const writer = await buildWriter(opts.dryRun, root);
   console.log(`Flag/metric creation: ${writer ? `enabled → app project '${writer.projectKey}'` : "disabled (dry run)"}.`);
   console.log(`Code changes: ${opts.dryRun ? "disabled (dry run)" : "enabled (edits land in your working tree; nothing is pushed)"}.`);
 
@@ -327,10 +373,12 @@ async function run(opts: CliOptions): Promise<number> {
           ...localOpts,
           ...(process.env.AWS_REGION ? { awsRegion: process.env.AWS_REGION } : {}),
         })
-      : new AnthropicAgentRunner({
-          ...localOpts,
-          ...(process.env.ANTHROPIC_API_KEY ? { apiKey: process.env.ANTHROPIC_API_KEY } : {}),
-        });
+      : provider === "openai"
+        ? new OpenAiAgentRunner(localOpts)
+        : new AnthropicAgentRunner({
+            ...localOpts,
+            ...(process.env.ANTHROPIC_API_KEY ? { apiKey: process.env.ANTHROPIC_API_KEY } : {}),
+          });
 
   // The approval policy (mode/threshold/gates flags) compiles into
   // pre-execution gates. The CLI's gate answer is non-blocking, like the
@@ -438,7 +486,9 @@ async function run(opts: CliOptions): Promise<number> {
   const judgeCompletion: JudgeCompletion | undefined =
     provider === "bedrock"
       ? createBedrockJudgeCompletion(process.env.AWS_REGION)
-      : createAnthropicJudgeCompletion(process.env.ANTHROPIC_API_KEY);
+      : provider === "openai"
+        ? createOpenAiJudgeCompletion()
+        : createAnthropicJudgeCompletion(process.env.ANTHROPIC_API_KEY);
   const baseJudgeHook = judgeCompletion
     ? createJudgeHook({
         aiClient,
@@ -466,6 +516,31 @@ async function run(opts: CliOptions): Promise<number> {
   // code-side checks.
   const verifier = buildHandoffVerifier({ sandboxRoot: root, ...(writer ? { writer } : {}) });
 
+  // Jev pre-classification (optional; on with TYPESAFE_API_KEY, mode from the
+  // auto-factory-jev-mode flag). Metrics come from the app project when an API
+  // key is available — read-only, so dry runs get them too.
+  //
+  // Skipped on --resume: the entry node is replayed from the journal (its prompt, where
+  // the prefill lands, is never rebuilt), the working tree now carries the agents' own
+  // edits (Jev would classify those as if a human wrote them), and the original walk
+  // already emitted its comparison event before it halted — re-emitting double-counts.
+  const metricsReader =
+    writer ??
+    (process.env.LD_API_KEY && process.env.LD_APP_PROJECT_KEY ? new LdResourceWriter(new LdClient(appConnection())) : undefined);
+  const jev: Awaited<ReturnType<typeof startJevLayer>> = resume
+    ? { mode: "off" }
+    : await startJevLayer({
+        ldClient,
+        ldContext,
+        aiClient,
+        variables: variables,
+        context,
+        root,
+        ...(state.resolvedBase ? { baseRef: state.resolvedBase } : {}),
+        workingTree: true,
+        ...(metricsReader ? { listMetrics: () => metricsReader.listMetrics() } : {}),
+      });
+
   const walk = await walkGraph(graphDef, runner, context, {
     graphTracker,
     onEvent: (event) => {
@@ -486,6 +561,8 @@ async function run(opts: CliOptions): Promise<number> {
         console.log(`⏸ approval gate: stopped before ${event.node}`);
       } else if (event.type === "replay-diverged") {
         console.log(`⛔ resume aborted: ${event.info.detail}`);
+      } else if (event.type === "awaiting-input") {
+        console.log(`⏸ human input: ${event.node} paused with a question${event.question ? `: ${event.question}` : ""}`);
       }
     },
     gate,
@@ -543,6 +620,9 @@ async function run(opts: CliOptions): Promise<number> {
       { inForce: carriedFeedback, totalRuns: walk.runs.length, replayedRuns },
     );
     } else {
+      // Includes a pause on an agent's question (walk.pendingInput): that pause is
+      // answered in the manifest and resumed by a FRESH run, not a replay — the asking
+      // step must re-run live to read the answer — so there is no journal to keep.
       clearWalkState(root);
     }
   }
@@ -566,6 +646,9 @@ async function run(opts: CliOptions): Promise<number> {
   console.log(`\nRan ${walk.runs.length} node(s): ${walk.runs.map((r) => r.configKey).join(" → ")}`);
   if (walk.skipped.length) console.log(`Skipped: ${walk.skipped.join(", ")}`);
 
+  const jevTable = finishJevLayer(jev, { ldClient, ldContext, tags: walk.tags, runs: walk.runs });
+  if (jevTable) console.log(`\n${jevTable}`);
+
   // Halted at an approval gate: the gated step (and everything downstream) did
   // NOT run — nothing was created for it. Tell the caller exactly how to
   // resume, carrying forward every already-approved step.
@@ -574,7 +657,7 @@ async function run(opts: CliOptions): Promise<number> {
     const approveFlags = [...new Set([...approvedSteps, node])].map((s) => `--approve ${s}`).join(" ");
     const lines = [
       "",
-      `⏸ Approval required before '${node}'. Nothing was created for this or later steps.`,
+      `⏸ Approval required before '${node}'. ${createdSoFar(walk, "Nothing was created for this or later steps.")}`,
       "If a human approves, re-run past this gate with:",
       `  autofactory run --graph ${opts.graphKey}${opts.dryRun ? " --dry-run" : ""} ${approveFlags}`,
     ];
@@ -601,8 +684,43 @@ async function run(opts: CliOptions): Promise<number> {
     return EXIT.PENDING_APPROVAL;
   }
 
+  // Halted on an agent's question (M14): the asking step deliberately created
+  // nothing, and downstream steps did not run. The question lives durably in
+  // the manifest's humanInput block; a human answers there and re-runs — the
+  // fresh walk finds the answer and completes the job.
+  if (walk.pendingInput) {
+    const { node, question } = walk.pendingInput;
+    const manifestPath = context.PR_NUMBER ? `.release-flags/pr-${context.PR_NUMBER}.json` : ".release-flags/<pr>.json";
+    console.log(
+      [
+        "",
+        `⏸ '${node}' paused with a question for a human. ${createdSoFar(walk, "Nothing was created for this or later steps.")}`,
+        ...(question ? [`Question: ${question}`] : []),
+        `Answer it by setting "humanInput": {"answer": "..."} in ${manifestPath} (the full`,
+        "question and the agent's analysis are in the step output above), then re-run:",
+        `  autofactory run --graph ${opts.graphKey}${opts.dryRun ? " --dry-run" : ""}${[...approvedSteps].map((s) => ` --approve ${s}`).join("")}`,
+      ].join("\n"),
+    );
+    return EXIT.PENDING_INPUT;
+  }
+
   const verdict = interpretWalk(walk.tags, walk.inventory, walk.runs);
   const decision = decideApproval(verdict);
+
+  // A "no" nobody can read is a dead end for whoever has to act on it. The
+  // Action dumps every node's final output into its log; the CLI stays quiet on
+  // success — the summary below is enough — but when the answer is no it prints
+  // the deciding agent's own words, so the reason survives wherever this run is
+  // being tailed rather than dying with the process.
+  if (!decision.apply && !decision.noop) {
+    const blamed = walk.runs.filter(
+      (r) => r.configKey.includes("code-reviewer") || r.status === "failed",
+    );
+    for (const r of blamed.length ? blamed : walk.runs.slice(-1)) {
+      console.log(`\n──────── why: ${r.configKey} [${r.status}] ────────`);
+      console.log((r.output || "(the agent produced no output)").slice(0, 4000));
+    }
+  }
 
   // Release intent: validate the manifest's releaseIntent deterministically so
   // problems surface here, where a human can still fix them, instead of at

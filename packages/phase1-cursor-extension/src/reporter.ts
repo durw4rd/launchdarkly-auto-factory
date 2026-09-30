@@ -33,6 +33,11 @@ export interface RunResult {
   pendingApproval?: { node: string };
   /** Set when a loop did not converge — a hard failure, overrides apply. */
   loopExhausted?: LoopExhaustedInfo;
+  /**
+   * Set when an agent paused the chain on a question for a human (M14).
+   * Answer lives in the release manifest's `humanInput.answer`; re-run after.
+   */
+  pendingInput?: { node: string; question?: string };
 }
 
 export interface RunReporter {

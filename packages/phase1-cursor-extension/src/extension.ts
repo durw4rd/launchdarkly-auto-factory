@@ -184,8 +184,10 @@ async function runOnce(context: vscode.ExtensionContext, reason: string): Promis
 
         const verb = result.loopExhausted
           ? `⚠ did not converge (loop budget exhausted at ${nodeTitle(result.loopExhausted.node)})`
-          : result.pendingApproval
-            ? `⏸ stopped before ${nodeTitle(result.pendingApproval.node)} (approval declined)`
+          : result.pendingInput
+            ? `⏸ ${nodeTitle(result.pendingInput.node)} needs a human answer (see Output; reply in the manifest's humanInput.answer, then re-run)`
+            : result.pendingApproval
+              ? `⏸ stopped before ${nodeTitle(result.pendingApproval.node)} (approval declined)`
             : result.decision.apply
               ? "✓ approved"
               : result.decision.noop

@@ -27,6 +27,8 @@ import {
   type JudgeHook,
   createAnthropicJudgeCompletion,
   createCursorJudgeCompletion,
+  createOpenAiJudgeCompletion,
+  OpenAiAgentRunner,
   createGitDiffEvidence,
   createJudgeHook,
   LdClient,
@@ -45,8 +47,11 @@ import {
   describeLoopEdgeShadowed,
   describeLoopExhausted,
   extractConfigStamp,
+  finishJevLayer,
   getLdSdk,
+  intentTicketId,
   interpretWalk,
+  parseIntentMarker,
   intentIsDefault,
   initFactorySentry,
   loadRelatedRepos,
@@ -54,9 +59,11 @@ import {
   pipelineContext,
   resolveAiProvider,
   resolveApprovalPolicy,
+  startJevLayer,
   targetConnection,
   walkGraph,
   withProvider,
+  withRunAttributes,
 } from "@auto-factory/shared";
 import { postCheckRun } from "./checkRun.js";
 import { postPrComment } from "./comment.js";
@@ -157,6 +164,12 @@ function createAgentRunner(provider: string, kg?: AssembledGraph): AgentRunner {
     });
   }
 
+  if (provider === "openai") {
+    // Same agent contract on OpenAI Chat Completions (ADR 0018). Key from
+    // OPENAI_API_KEY (or CODEX_API_KEY).
+    return new OpenAiAgentRunner(localOpts);
+  }
+
   // Anthropic (default).
   return new AnthropicAgentRunner({
     ...localOpts,
@@ -181,6 +194,9 @@ function createJudgeCompletion(provider: string): JudgeCompletion | undefined {
   }
   if (provider === "bedrock") {
     return createBedrockJudgeCompletion(process.env.AWS_REGION);
+  }
+  if (provider === "openai") {
+    return createOpenAiJudgeCompletion();
   }
   console.log(`Judges: no local judge execution on provider '${provider}' — attached judges are skipped.`);
   return undefined;
@@ -313,15 +329,31 @@ function describeStall(stall: StallInfo): string {
  * — on a first pass the gate pauses before the gated step, so "nothing created
  * for this or later steps" stays accurate even if earlier steps created things.
  */
-function gateStatusLine(pendingNode: string, reworked: boolean, inventory: Record<string, string>): string {
-  const created = [
+function priorCreations(inventory: Record<string, string>): string[] {
+  return [
     inventory.flag_key ? `flag \`${inventory.flag_key}\`` : "",
     inventory.metric_keys ? `metric(s) \`${inventory.metric_keys}\`` : "",
   ].filter(Boolean);
+}
+
+function gateStatusLine(pendingNode: string, reworked: boolean, inventory: Record<string, string>): string {
+  const created = priorCreations(inventory);
   if (reworked && created.length) {
     return `The chain paused before **${pendingNode}**. A prior iteration already created ${created.join(" and ")}; approving may re-run this step (up to its \`max_visits\` budget) against new input.`;
   }
   return `The chain paused before **${pendingNode}**. Nothing was created for this or later steps yet.`;
+}
+
+/**
+ * Same idea for an M14 question pause: the asking step created nothing this
+ * pass, but when a loop re-ran it an earlier iteration may already have.
+ */
+function inputStatusLine(node: string, reworked: boolean, inventory: Record<string, string>): string {
+  const created = priorCreations(inventory);
+  if (reworked && created.length) {
+    return `\`${node}\` paused the chain on a question it could not answer from the repo. A prior iteration already created ${created.join(" and ")}; this pass created nothing new and later steps did not run.`;
+  }
+  return `\`${node}\` paused the chain on a question it could not answer from the repo. Nothing was created for this or later steps.`;
 }
 
 function buildGateComment(gatedSteps: string[], approved: Set<string>, pendingNode: string, statusLine: string): string {
@@ -352,7 +384,9 @@ function buildVariables(ctx: PrContext): Record<string, unknown> {
     PR_BODY: ctx.PR_BODY ?? "",
     REPO: ctx.REPO ?? "",
     PR_BRANCH: process.env.PR_BRANCH ?? "",
-    TICKET_ID: process.env.TICKET_ID ?? "",
+    // The intent marker in the PR body (issue intake, ADR 0019) supplies the
+    // ticket when the workflow doesn't set one — the join key for both runs.
+    TICKET_ID: process.env.TICKET_ID ?? intentTicketId(ctx.PR_BODY) ?? "",
     LAUNCHDARKLY_PROJECT: process.env.LD_APP_PROJECT_KEY ?? "autofactory-demo",
   };
 }
@@ -376,6 +410,7 @@ function mapActionInputs(): void {
   set("AWS_SESSION_TOKEN", "aws_session_token");
   set("CURSOR_API_KEY", "cursor_api_key");
   set("CURSOR_MODEL", "cursor_model");
+  set("TYPESAFE_API_KEY", "typesafe_api_key");
   set("LD_API_KEY", "ld_api_key");
   set("LD_BASE_URL", "ld_base_url");
   set("LD_PROJECT_KEY", "ld_project_key");
@@ -438,9 +473,36 @@ async function main(): Promise<void> {
 
   // Native LaunchDarkly: server SDK (flag eval) + AI SDK (graph + agent configs).
   const { ldClient, aiClient } = await getLdSdk();
+  // Surface for provider-flag targeting (ADR 0018): the workflow template sets
+  // AUTOFACTORY_SURFACE; default it here so older workflow copies still route.
+  process.env.AUTOFACTORY_SURFACE ||= "github-action";
   let ldContext = pipelineContext();
+  // Join keys on the run context (ADR 0019): the PR, the repo, and the intent
+  // (ticket) when the PR body carries an intake marker or TICKET_ID is set —
+  // so this run's agent telemetry joins the intake run's and the flag's.
+  const intentMarker = parseIntentMarker(context.PR_BODY);
+  const ticketId = process.env.TICKET_ID || intentMarker?.intent;
+  ldContext = withRunAttributes(ldContext, {
+    entry: "pr",
+    pr: context.PR_NUMBER,
+    repo: context.REPO,
+    ticket: ticketId,
+    intake_run: intentMarker?.intakeRun,
+  });
+  if (ticketId) console.log(`Intent: ${ticketId}${intentMarker?.intakeRun ? ` (opened by intake run ${intentMarker.intakeRun})` : ""}`);
 
-  const provider = await resolveAiProvider(ldClient, ldContext);
+  let provider = await resolveAiProvider(ldClient, ldContext);
+  // Graceful degradation for key-less providers: the bootstrap-default GHA
+  // targeting is a 50/50 anthropic/cursor rollout (ADR 0018), and a repo that
+  // never configured the selected provider's key must fall back, not fail.
+  if (provider === "cursor" && !process.env.CURSOR_API_KEY) {
+    console.log("Provider flag selects 'cursor' but CURSOR_API_KEY is not set — falling back to Anthropic.");
+    provider = "anthropic";
+  }
+  if (provider === "openai" && !process.env.OPENAI_API_KEY && !process.env.CODEX_API_KEY) {
+    console.log("Provider flag selects 'openai' but OPENAI_API_KEY/CODEX_API_KEY is not set — falling back to Anthropic.");
+    provider = "anthropic";
+  }
   // Stamp the resolved provider on the run context so AI config targeting can
   // serve provider-compatible model variations (rules on `run.provider`).
   ldContext = withProvider(ldContext, provider);
@@ -558,7 +620,26 @@ async function main(): Promise<void> {
   const verifierWriter = flagCreationWriter();
   const verifier = buildHandoffVerifier({ sandboxRoot, ...(verifierWriter ? { writer: verifierWriter } : {}) });
 
+  // Jev pre-classification (optional; on with TYPESAFE_API_KEY, mode from the
+  // auto-factory-jev-mode flag). Metrics are read from the app project when an
+  // API key is available, whether or not flag creation is enabled.
+  const metricsReader =
+    verifierWriter ??
+    (process.env.LD_API_KEY && process.env.LD_APP_PROJECT_KEY ? new LdResourceWriter(new LdClient(appConnection())) : undefined);
+  const jev = await startJevLayer({
+    ldClient,
+    ldContext,
+    aiClient,
+    variables: buildVariables(context),
+    context,
+    root: sandboxRoot,
+    ...(process.env.PR_BASE_REF ? { baseRef: process.env.PR_BASE_REF } : {}),
+    ...(metricsReader ? { listMetrics: () => metricsReader.listMetrics() } : {}),
+  });
+
   const walk = await walkGraph(graphDef, runner, context, { graphTracker, gate, judgeHook, verifier });
+  const jevTable = finishJevLayer(jev, { ldClient, ldContext, tags: walk.tags, runs: walk.runs });
+  if (jevTable) console.log(`\n${jevTable}`);
 
   // Per-node visibility: dump each agent's terminal status, routing tags, and final output.
   for (const r of walk.runs) {
@@ -628,6 +709,37 @@ async function main(): Promise<void> {
       conclusion: "action_required",
       title: `Approval required before ${node}`,
       summary: `${statusLine} Add the PR label \`${label}\` to approve; the chain resumes on the next run.`,
+    });
+    return;
+  }
+
+  // Halted on an agent's question (M14): the asking step deliberately created
+  // nothing and downstream steps did not run. The question was written to the
+  // manifest's humanInput block on the PR branch; the human answers by editing
+  // `humanInput.answer` there — that push re-triggers this workflow, and the
+  // fresh walk finds the answer and completes. Like an approval pause, this is
+  // an `action_required` check, not a red failure; the job exits 0.
+  if (walk.pendingInput) {
+    const { node, question } = walk.pendingInput;
+    const manifestPath = context.PR_NUMBER ? `.release-flags/pr-${context.PR_NUMBER}.json` : ".release-flags/<pr>.json";
+    console.log(`::warning::AutoFactory: '${node}' paused with a question for a human${question ? `: ${question}` : ""}.`);
+    await postPrComment(
+      [
+        `## ⏸ AutoFactory needs a human answer`,
+        "",
+        inputStatusLine(node, walk.runs.some((r) => r.iteration > 1), walk.inventory),
+        "",
+        ...(question ? [`> ${question}`, ""] : []),
+        `**To answer:** edit \`${manifestPath}\` on this branch and set \`"humanInput": {"answer": "..."}\` (the agent's full analysis is in the run log). Pushing the edit re-runs the chain, which reads your answer and continues.`,
+      ].join("\n"),
+      { prNumber: context.PR_NUMBER, repo: context.REPO },
+    );
+    await postCheckRun({
+      repo: context.REPO,
+      headSha: context.HEAD_SHA,
+      conclusion: "action_required",
+      title: `Human answer needed by ${node}`,
+      summary: `The chain paused on a question from \`${node}\`${question ? `: ${question}` : ""}. Answer in \`${manifestPath}\` → \`humanInput.answer\` and push; the chain resumes on the next run.`,
     });
     return;
   }
@@ -706,6 +818,7 @@ async function main(): Promise<void> {
     "| Agent | Status | Judge | Tags |",
     "|---|---|---|---|",
     ...(agentRows.length ? agentRows : ["| (none ran) | — | — | — |"]),
+    ...(jevTable ? ["", "<details><summary>Jev pre-classification</summary>", "", jevTable, "", "</details>"] : []),
   ]
     .filter(Boolean)
     .join("\n");

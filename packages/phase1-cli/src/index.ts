@@ -24,3 +24,4 @@ export {
   walkStatePath,
   writeWalkState,
 } from "./walkState.js";
+export { runIntake } from "./intake.js";

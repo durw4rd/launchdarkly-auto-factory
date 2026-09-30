@@ -71931,7 +71931,7 @@ var require_dist_cjs50 = __commonJS({
 });
 
 // src/action.ts
-import { execFileSync as execFileSync4 } from "node:child_process";
+import { execFileSync as execFileSync5 } from "node:child_process";
 import { existsSync as existsSync6, readFileSync as readFileSync8, writeFileSync as writeFileSync2 } from "node:fs";
 import { dirname as dirname5, join as join12, resolve as resolve7 } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -72084,6 +72084,22 @@ var LdClient = class {
       body
     });
   }
+  /** Get an AI config's per-environment targeting (rules, variation ids). */
+  getAiConfigTargeting(key) {
+    return this.request({
+      path: `/api/v2/projects/${this.conn.projectKey}/ai-configs/${key}/targeting`,
+      headers: BETA
+    });
+  }
+  /** Semantic-patch an AI config's targeting in one environment (beta). */
+  patchAiConfigTargeting(key, body) {
+    return this.request({
+      method: "PATCH",
+      path: `/api/v2/projects/${this.conn.projectKey}/ai-configs/${key}/targeting`,
+      headers: BETA,
+      body
+    });
+  }
   /** Get an agent graph; returns status 404 (not throwing) when absent. */
   getAgentGraph(key) {
     return this.request({
@@ -72107,6 +72123,17 @@ var LdClient = class {
       path: `/api/v2/projects/${this.conn.projectKey}/agent-graphs/${key}`,
       headers: BETA,
       body
+    });
+  }
+  // --- Account members ------------------------------------------------------
+  /**
+   * Search account members (ACCOUNT-level endpoint — no project in the path).
+   * `query` matches name/email fuzzily; callers wanting an exact email must
+   * filter the returned items themselves.
+   */
+  findMembers(query, limit2 = 20) {
+    return this.request({
+      path: `/api/v2/members?filter=${encodeURIComponent(`query:${query}`)}&limit=${limit2}`
     });
   }
   // --- Flags & metrics ------------------------------------------------------
@@ -74517,16 +74544,27 @@ function withProvider(context, provider) {
     return context;
   return { ...multi, run: { ...multi.run, provider } };
 }
+function withRunAttributes(context, attrs) {
+  const multi = context;
+  if (multi.kind !== "multi" || !multi.run)
+    return context;
+  const clean = Object.fromEntries(Object.entries(attrs).filter(([k6, v]) => k6 !== "key" && v !== void 0 && v !== null && v !== ""));
+  if (Object.keys(clean).length === 0)
+    return context;
+  return { ...multi, run: { ...multi.run, ...clean } };
+}
 function pipelineContext(extra = {}) {
   currentRunId = randomUUID2();
+  const surface = process.env.AUTOFACTORY_SURFACE?.trim();
   return {
     kind: "multi",
     service: {
       key: process.env.LD_PIPELINE_CONTEXT_KEY ?? "auto-factory-phase1",
       name: "AutoFactory Phase 1",
+      ...surface ? { surface } : {},
       ...extra
     },
-    run: { key: currentRunId }
+    run: { key: currentRunId, ...surface ? { surface } : {} }
   };
 }
 
@@ -74703,7 +74741,10 @@ var ROUTING_TAGS = /* @__PURE__ */ new Set([
   "risk_level",
   "risk_score",
   // See the note above this Set for why (ADR 0014).
-  "sentry_guardrail"
+  "sentry_guardrail",
+  // See the note above this Set for why (ADR 0017).
+  "needs_human_input",
+  "human_question"
 ]);
 var FACT_TAGS = /* @__PURE__ */ new Set([
   "flag_ready",
@@ -74890,10 +74931,11 @@ ${trigger.detail}` : "";
 This is a re-run of an earlier step; a previous iteration already executed. ${why}${detailBlock}${factBlock}
 === END REWORK CONTEXT ===`;
 }
-function buildPrompt(isRoot, hasInbound, iteration, inventory, ctx, trigger, humanFeedback) {
+function buildPrompt(isEntry, hasInbound, iteration, inventory, ctx, trigger, humanFeedback) {
   const header = [
     ctx.REPO ? `Repository: ${ctx.REPO}` : "",
-    ctx.PR_NUMBER ? `Pull request: #${ctx.PR_NUMBER}` : "",
+    ctx.ISSUE_NUMBER ? `Issue: #${ctx.ISSUE_NUMBER}` : ctx.PR_NUMBER ? `Pull request: #${ctx.PR_NUMBER}` : "",
+    ctx.ISSUE_NUMBER && ctx.PR_BRANCH ? `Working branch: ${ctx.PR_BRANCH}` : "",
     ctx.PR_TITLE ? `Title: ${ctx.PR_TITLE}` : ""
   ].filter(Boolean).join("\n");
   const parts = [header];
@@ -74904,8 +74946,11 @@ function buildPrompt(isRoot, hasInbound, iteration, inventory, ctx, trigger, hum
 ${humanFeedback}
 === END HUMAN GUIDANCE ===`);
   }
-  if (isRoot && typeof ctx.PR_BODY === "string" && ctx.PR_BODY)
+  if (isEntry && typeof ctx.PR_BODY === "string" && ctx.PR_BODY)
     parts.push(ctx.PR_BODY);
+  if (isEntry && typeof ctx.PRECLASSIFICATION === "string" && ctx.PRECLASSIFICATION) {
+    parts.push(ctx.PRECLASSIFICATION);
+  }
   if (hasInbound) {
     const brief = typeof ctx.PREVIOUS_STEP_OUTPUT === "string" ? ctx.PREVIOUS_STEP_OUTPUT : "";
     if (brief)
@@ -74930,8 +74975,31 @@ function allNodeKeys(graphDef) {
   }
   return [...keys];
 }
+function intakeNodeKeys(graphDef) {
+  const raw = graphDef.getConfig();
+  const keys = /* @__PURE__ */ new Set();
+  for (const [source, edges] of Object.entries(raw.edges ?? {})) {
+    if (edges.some((e6) => e6.handoff?.intake === true))
+      keys.add(source);
+  }
+  return keys;
+}
+function defaultEntryNode(graphDef) {
+  const intake = intakeNodeKeys(graphDef);
+  let node = graphDef.rootNode();
+  const seen = /* @__PURE__ */ new Set();
+  while (node && intake.has(node.getKey()) && !seen.has(node.getKey())) {
+    seen.add(node.getKey());
+    const forward = node.getEdges().find((e6) => e6.handoff?.intake === true);
+    const next = forward ? graphDef.getNode(forward.key) : null;
+    if (!next)
+      break;
+    node = next;
+  }
+  return node;
+}
 async function walkGraph(graphDef, runner, context, inputs = {}) {
-  const { graphTracker, onEvent, gate, judgeHook, verifier, resume } = inputs;
+  const { graphTracker, onEvent, gate, judgeHook, verifier, resume, startAt } = inputs;
   const journal = resume?.journal ?? [];
   const runs = [];
   const accumulatedTags = {};
@@ -74948,16 +75016,25 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
   const runCountByKey = /* @__PURE__ */ new Map();
   const loopEdgeShadowed = [];
   const shadowWarned = /* @__PURE__ */ new Set();
-  const rootKey = graphDef.getConfig().root;
   const maxTotalNodeRuns = Math.max(1, allNodeKeys(graphDef).length) * (MAX_VISITS_HARD_CAP + 1);
   let totalRuns = 0;
   const startMs = Date.now();
   let anyReplayed = false;
   const totalTokens = { total: 0, input: 0, output: 0 };
-  let node = graphDef.rootNode();
+  let node;
+  if (startAt) {
+    node = graphDef.getNode(startAt);
+    if (!node)
+      throw new Error(`walkGraph: start node '${startAt}' is not in the graph`);
+  } else {
+    node = defaultEntryNode(graphDef);
+  }
+  const entryKey = node.getKey();
+  const stopAfter = new Set(inputs.stopAfter ?? []);
   let inboundHandoff;
   let stalledAt;
   let pendingApproval;
+  let pendingInput;
   let verificationFailed;
   let loopExhausted;
   let replayDiverged;
@@ -75015,7 +75092,7 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
     const humanFeedback = replaying ? void 0 : pendingHumanFeedback;
     if (!replaying)
       pendingHumanFeedback = void 0;
-    const prompt = buildPrompt(key === rootKey, inboundHandoff !== void 0, iteration, inventory, ctx, trigger, humanFeedback);
+    const prompt = buildPrompt(key === entryKey, inboundHandoff !== void 0, iteration, inventory, ctx, trigger, humanFeedback);
     const result = replayEntry ? {
       status: replayEntry.status,
       // The recorded final text, re-wrapped so the rest of the loop (which reads
@@ -75100,6 +75177,14 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
         console.warn(`[verify] shim errored for '${key}' (non-fatal): ${e6 instanceof Error ? e6.message : e6}`);
       }
     }
+    if (result.tags.needs_human_input === "true") {
+      const question = result.tags.human_question;
+      pendingInput = { node: key, ...question ? { question } : {} };
+      onEvent?.({ type: "awaiting-input", node: key, ...question ? { question } : {} });
+      break;
+    }
+    if (stopAfter.has(key))
+      break;
     let next = null;
     let nextHandoff;
     let nextIsLoopEdge = false;
@@ -75252,7 +75337,7 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
     };
     onEvent?.({ type: "replay-diverged", info: replayDiverged });
   }
-  if (graphTracker && !pendingApproval && !anyReplayed && runs.length > 0) {
+  if (graphTracker && !pendingApproval && !pendingInput && !anyReplayed && runs.length > 0) {
     try {
       graphTracker.trackPath(runs.map((r6) => r6.configKey));
       graphTracker.trackDuration(Date.now() - startMs);
@@ -75271,7 +75356,8 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
     }
   }
   const reached = new Set(runs.map((r6) => r6.configKey));
-  const skipped = allNodeKeys(graphDef).filter((k6) => !reached.has(k6));
+  const intake = intakeNodeKeys(graphDef);
+  const skipped = allNodeKeys(graphDef).filter((k6) => !reached.has(k6) && !intake.has(k6));
   return {
     runs,
     tags: accumulatedTags,
@@ -75279,6 +75365,7 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
     skipped,
     ...stalledAt ? { stalledAt } : {},
     ...pendingApproval ? { pendingApproval } : {},
+    ...pendingInput ? { pendingInput } : {},
     ...verificationFailed ? { verificationFailed } : {},
     ...loopExhausted ? { loopExhausted } : {},
     ...replayDiverged ? { replayDiverged } : {},
@@ -75690,7 +75777,7 @@ var VegaAgentRunner = class {
 // ../shared/dist/providerFlag.js
 var PROVIDER_FLAG_KEY = "auto-factory-ai-provider";
 var DEFAULT_PROVIDER = "anthropic";
-var KNOWN_PROVIDERS = /* @__PURE__ */ new Set(["anthropic", "bedrock", "vega", "cursor"]);
+var KNOWN_PROVIDERS = /* @__PURE__ */ new Set(["anthropic", "bedrock", "vega", "cursor", "openai"]);
 async function resolveAiProvider(ldClient, context, flagKey = PROVIDER_FLAG_KEY) {
   const value = await ldClient.variation(flagKey, context, DEFAULT_PROVIDER);
   return KNOWN_PROVIDERS.has(value) ? value : DEFAULT_PROVIDER;
@@ -76192,8 +76279,10 @@ function resolveParentVariationId(parent, parentKey, env2, variation) {
 }
 var LdResourceWriter = class {
   ld;
-  constructor(ld) {
+  opts;
+  constructor(ld, opts = {}) {
     this.ld = ld;
+    this.opts = opts;
   }
   get projectKey() {
     return this.ld.projectKey;
@@ -76229,6 +76318,8 @@ var LdResourceWriter = class {
       ],
       // On = v1 (index 1); Off = control (index 0) — flag-off preserves existing behavior.
       defaults: { onVariation: 1, offVariation: 0 },
+      // New flags only — a 409 reuse below keeps the existing flag's maintainer.
+      ...this.opts.maintainerId ? { maintainerId: this.opts.maintainerId } : {},
       ...clientSide ? { clientSideAvailability: { usingEnvironmentId: true, usingMobileKey: false } } : {}
     };
     const res = await this.ld.createFlag(body);
@@ -76676,7 +76767,7 @@ var USE_EXISTING_FLAG_TOOL = {
 };
 var CREATE_METRIC_TOOL = {
   name: "create_metric",
-  description: "Create a guarded-release metric in LaunchDarkly (the app/data-plane project). TWO backings: (1) EVENT-backed (default) \u2014 pass event_key; you must FIRST instrument the matching event in code (a LaunchDarkly `track(event_key, \u2026)` call on the path the flag wraps, via edit_file) so the metric has data once live \u2014 EXCEPTION: event_key `sentry-errors` is fed by the LD\u2194Sentry integration (no track() emitter). Prefer reusing provisioned `sentry-errors-binary` / `sentry-errors-count` via list_metrics when Sentry is present (ADR 0014). (2) TRACE-backed \u2014 pass trace_query (an observability span filter, e.g. service_name=x AND span_name=\"GET /api/y\") INSTEAD of event_key; valid ONLY when the flag is evaluated inside the matched trace (the observability SDK's afterEvaluation hook enriches the span \u2014 see your Metric Backing rules), and requires the service to already emit spans. Latency-category trace metrics measure the span's duration (override with trace_value_location). Idempotent: re-creating an existing key is a no-op. After it succeeds the metrics_created/metric_keys tags are updated for you.",
+  description: 'Create a guarded-release metric in LaunchDarkly (the app/data-plane project). TWO backings: (1) EVENT-backed (default) \u2014 pass event_key; FIRST instrument the matching event in code (a LaunchDarkly `track(event_key, \u2026)` call on the path the flag wraps, via edit_file) so the metric has data once live. EXCEPTION: event_key `sentry-errors` is fed by the LD\u2194Sentry integration (no track() emitter) \u2014 prefer reusing provisioned `sentry-errors-binary`/`sentry-errors-count` via list_metrics when Sentry is present. (2) TRACE-backed \u2014 pass trace_query (a span filter, e.g. service_name=x AND span_name="GET /api/y") INSTEAD of event_key; valid ONLY when a LaunchDarkly evaluation hook (o11y plugin or OTel tracing hook) enriches spans in the matched trace AND those traces reach LaunchDarkly \u2014 see your Metric Backing rules. Latency-category trace metrics measure span duration (override with trace_value_location). Idempotent: re-creating a key is a no-op; on success the metrics_created/metric_keys tags update.',
   input_schema: {
     type: "object",
     properties: {
@@ -76872,7 +76963,7 @@ var QUERY_RELATED_REPOS_TOOL = {
 };
 var WRITE_MANIFEST_TOOL = {
   name: "write_manifest",
-  description: "Create or update the release manifest (.release-flags/pr-<N>.json). Pass only the fields you own \u2014 they are MERGED into the existing file (agent fields: flagKey, scope, targetVariation, releasePlan.*). Set targetVariation (e.g. 'v2') whenever this PR's code path lives under a specific variation of an existing flag \u2014 Beacon releases exactly that variation on deploy; omit it for a fresh flag (whole-flag release of v1). The human-editable releaseIntent block is auto-initialized on first write and PRESERVED on later writes (you cannot overwrite it). The file is validated, written as schema 1.2, and committed to the PR branch automatically \u2014 do not also edit it with write_file/edit_file.",
+  description: "Create or update the release manifest (.release-flags/pr-<N>.json). Pass only the fields you own \u2014 they are MERGED into the existing file (agent fields: flagKey, scope, targetVariation, releasePlan.*, humanInput.question). Set targetVariation (e.g. 'v2') whenever this PR's code path lives under a specific variation of an existing flag \u2014 Beacon releases exactly that variation on deploy; omit it for a fresh flag (whole-flag release of v1). The human-editable releaseIntent block is auto-initialized on first write and PRESERVED on later writes (you cannot overwrite it). humanInput carries a question you need a human to answer (a pause per your instructions): you may set humanInput.question; humanInput.answer is HUMAN-owned and always preserved \u2014 you can never write or clear it. The file is validated, written as schema 1.2, and committed to the PR branch automatically \u2014 do not also edit it with write_file/edit_file.",
   input_schema: {
     type: "object",
     properties: {
@@ -77000,6 +77091,7 @@ var SandboxToolExecutor = class {
   gitMode;
   allowWriteManifest;
   stewardManifest;
+  skipCi;
   tags = {};
   knowledgeGraph;
   changedFiles = [];
@@ -77022,7 +77114,7 @@ var SandboxToolExecutor = class {
   provideRelatedRepos(client) {
     this.relatedRepos = client;
   }
-  constructor(root6, writer, allowEdits = false, prBranch, prBaseRef, gitMode = "push", allowWriteManifest = false, stewardManifest = false) {
+  constructor(root6, writer, allowEdits = false, prBranch, prBaseRef, gitMode = "push", allowWriteManifest = false, stewardManifest = false, skipCi = true) {
     this.root = root6;
     this.writer = writer;
     this.allowEdits = allowEdits;
@@ -77031,6 +77123,7 @@ var SandboxToolExecutor = class {
     this.gitMode = gitMode;
     this.allowWriteManifest = allowWriteManifest;
     this.stewardManifest = stewardManifest;
+    this.skipCi = skipCi;
   }
   /** Resolve a repo-relative path and reject anything escaping the sandbox root. */
   safeResolve(rel) {
@@ -77576,6 +77669,19 @@ ${verdicts.join("\n")}` : "")
         };
       }
     }
+    const existingHuman = existing.humanInput;
+    const incHuman = inc.humanInput && typeof inc.humanInput === "object" && !Array.isArray(inc.humanInput) ? inc.humanInput : void 0;
+    let humanInput;
+    let humanNote = "";
+    if (incHuman) {
+      humanInput = {
+        ...typeof incHuman.question === "string" && incHuman.question.trim() ? { question: incHuman.question } : typeof existingHuman?.question === "string" ? { question: existingHuman.question } : {},
+        ...existingHuman?.answer !== void 0 ? { answer: existingHuman.answer } : {}
+      };
+      humanNote = existingHuman?.answer !== void 0 ? "; humanInput.question set (existing human answer PRESERVED \u2014 you cannot write it)" : "; humanInput.question set (awaiting a human answer in the manifest)";
+    } else if (existingHuman) {
+      humanInput = existingHuman;
+    }
     const existingIntent = existing.releaseIntent;
     let intent;
     let intentNote;
@@ -77592,14 +77698,15 @@ ${verdicts.join("\n")}` : "")
       intent = intentSkeleton();
       intentNote = "releaseIntent initialized (human-editable skeleton)";
     }
-    const { releasePlan: _ip, releaseOverrides: _io, releaseIntent: _ii, schemaVersion: _iv, ...incRest } = inc;
-    const { releasePlan: _ep, releaseOverrides: _eo, releaseIntent: _ei2, schemaVersion: _ev, ...existRest } = existing;
+    const { releasePlan: _ip, releaseOverrides: _io, releaseIntent: _ii, humanInput: _ih, schemaVersion: _iv, ...incRest } = inc;
+    const { releasePlan: _ep, releaseOverrides: _eo, releaseIntent: _ei2, humanInput: _eh, schemaVersion: _ev, ...existRest } = existing;
     const manifest = {
       schemaVersion: "1.2",
       ...existRest,
       ...incRest,
       releasePlan: mergedPlan,
-      releaseIntent: intent
+      releaseIntent: intent,
+      ...humanInput && Object.keys(humanInput).length > 0 ? { humanInput } : {}
     };
     const { issues } = normalizeReleaseIntent(intent);
     mkdirSync(dirname(abs), { recursive: true });
@@ -77630,7 +77737,7 @@ ${verdicts.join("\n")}` : "")
       }
     }
     return {
-      content: `${existed ? "Updated" : "Created"} ${rel} (schema 1.2); ${intentNote}; ${commitNote}.` + (issues.length ? ` Intent issues (informational): ${issues.join("; ")}` : "")
+      content: `${existed ? "Updated" : "Created"} ${rel} (schema 1.2); ${intentNote}${humanNote}; ${commitNote}.` + (issues.length ? ` Intent issues (informational): ${issues.join("; ")}` : "")
     };
   }
   writeFile(rel, content) {
@@ -77749,15 +77856,16 @@ ${s2.slice(-15e3)}` : s2;
     const where = dir || ".";
     const hasPyTests = has2("pytest.ini") || has2("pyproject.toml") || entries.some((f6) => /^test_.+\.py$|_test\.py$/.test(f6));
     if (has2("requirements.txt") || hasPyTests) {
+      const python = [resolve2(cwd, ".venv/bin/python3"), resolve2(this.root, ".venv/bin/python3")].find((p3) => existsSync2(p3)) ?? "python3";
       const log = [];
       if (has2("requirements.txt")) {
-        const i6 = this.sh("python3", ["-m", "pip", "install", "-q", "-r", "requirements.txt"], cwd);
+        const i6 = this.sh(python, ["-m", "pip", "install", "-q", "-r", "requirements.txt"], cwd);
         if (i6.code !== 0)
           log.push(`[deps] pip install -r requirements.txt exited ${i6.code}:
 ${i6.out.slice(-1200)}`);
       }
-      this.sh("python3", ["-m", "pip", "install", "-q", "pytest"], cwd);
-      const t = this.sh("python3", ["-m", "pytest", "-q"], cwd);
+      this.sh(python, ["-m", "pip", "install", "-q", "pytest"], cwd);
+      const t = this.sh(python, ["-m", "pytest", "-q"], cwd);
       const body = `${log.join("\n")}
 $ python3 -m pytest -q (in ${where})
 ${t.out}`.trim();
@@ -77827,7 +77935,7 @@ ${t.out}`), isError: t.code !== 0, ran: true };
       const staged = this.runGit(["diff", "--cached", "--name-only"]).trim();
       if (!staged)
         return { content: "commit_and_push: no changes to commit" };
-      const ciSafeMessage = /\[(skip ci|ci skip)\]/i.test(message) ? message : `${message}
+      const ciSafeMessage = !this.skipCi || /\[(skip ci|ci skip)\]/i.test(message) ? message : `${message}
 
 [skip ci]`;
       this.runGit(["commit", "-m", ciSafeMessage]);
@@ -78195,6 +78303,8 @@ function runFindCodeRefs(opts) {
     };
   }
   const outDir = mkdtempSync(join6(tmpdir(), "af-coderefs-"));
+  const rawBranch = process.env.PR_BRANCH || spawnSync2("git", ["-C", opts.sandboxRoot, "rev-parse", "--abbrev-ref", "HEAD"], { encoding: "utf8", timeout: 15e3 }).stdout?.trim();
+  const branch = (rawBranch && rawBranch !== "HEAD" ? rawBranch : "pr-checkout").replace(/[^A-Za-z0-9._-]+/g, "-");
   try {
     const run = spawnSync2("ld-find-code-refs", [
       "--dir",
@@ -78203,6 +78313,8 @@ function runFindCodeRefs(opts) {
       opts.projectKey,
       "--repoName",
       opts.repoName ?? "pr-checkout",
+      "--branch",
+      branch,
       "--dryRun",
       "--outDir",
       outDir
@@ -78492,6 +78604,10 @@ function isTransientApiError(e6) {
   return false;
 }
 var NODE_CAPABILITIES = {
+  // INTAKE entry node (ADR 0019): implements a GitHub issue on a fresh branch
+  // and pushes it — code edits, tests, docs, cross-repo reads. No flag/metric
+  // powers: the PR it opens goes through the regular chain, which owns those.
+  "autofactory-issue-coder": { createFlag: false, createMetric: false, editFiles: true, readDocs: true, queryRepos: true },
   // ROOT node: edges can't grant capabilities to it (grants ride inbound
   // handoffs), so the research planner's narrow manifest-write power lives here.
   // queryGraph: the planner's blast-radius input (ADR 0010) — only offered when
@@ -78609,7 +78725,7 @@ var AnthropicAgentRunner = class {
     const writer = caps.createFlag || caps.createMetric || caps.flagState ? this.opts.writer : void 0;
     const model = this.modelId(req.model);
     console.log(`[node] ${req.configKey} ${this.providerName} model \u2192 '${model}'${req.model && req.model !== model ? ` (LD: '${req.model}')` : ""}`);
-    const executor = new SandboxToolExecutor(this.opts.sandboxRoot, writer, caps.editFiles, this.opts.prBranch, this.opts.prBaseRef, this.opts.gitMode ?? "push", caps.writeManifest === true && this.opts.codeChangesEnabled === true, caps.stewardManifest === true && this.opts.codeChangesEnabled === true);
+    const executor = new SandboxToolExecutor(this.opts.sandboxRoot, writer, caps.editFiles, this.opts.prBranch, this.opts.prBaseRef, this.opts.gitMode ?? "push", caps.writeManifest === true && this.opts.codeChangesEnabled === true, caps.stewardManifest === true && this.opts.codeChangesEnabled === true, this.opts.skipCi ?? true);
     if (caps.queryGraph && this.opts.knowledgeGraph) {
       executor.provideKnowledgeGraph(this.opts.knowledgeGraph, this.opts.changedFiles ?? []);
     }
@@ -79593,6 +79709,212 @@ var BedrockAgentRunner = class {
   }
 };
 
+// ../shared/dist/openai/openaiAgentRunner.js
+var DEFAULT_MODEL2 = "gpt-5.2";
+var DEFAULT_BASE_URL = "https://api.openai.com/v1";
+var DEFAULT_MAX_TURNS2 = 100;
+var MAX_COMPLETION_TOKENS = 32e3;
+var TRANSIENT_RETRIES2 = 3;
+var TRANSIENT_BACKOFF_MS2 = [5e3, 15e3, 45e3];
+var OpenAiApiError = class extends Error {
+  status;
+  constructor(status, body) {
+    super(`OpenAI API ${status}: ${body.slice(0, 500)}`);
+    this.status = status;
+  }
+};
+function isTransient(e6) {
+  if (e6 instanceof OpenAiApiError)
+    return e6.status === 408 || e6.status === 429 || e6.status >= 500;
+  return e6 instanceof TypeError || e6 instanceof Error && e6.name === "AbortError";
+}
+async function openaiChat(apiKey, baseUrl, body, label) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const res = await fetch(`${baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      const text = await res.text();
+      if (!res.ok)
+        throw new OpenAiApiError(res.status, text);
+      return JSON.parse(text);
+    } catch (e6) {
+      if (!isTransient(e6) || attempt >= TRANSIENT_RETRIES2)
+        throw e6;
+      const delay = TRANSIENT_BACKOFF_MS2[attempt] ?? 45e3;
+      console.warn(`[node] ${label} transient OpenAI error (${e6 instanceof Error ? e6.message : e6}) \u2014 retry ${attempt + 1}/${TRANSIENT_RETRIES2} in ${delay / 1e3}s`);
+      await new Promise((r6) => setTimeout(r6, delay));
+    }
+  }
+}
+function openaiApiKey(explicit) {
+  return explicit || process.env.OPENAI_API_KEY || process.env.CODEX_API_KEY;
+}
+var OpenAiAgentRunner = class {
+  opts;
+  apiKey;
+  baseUrl;
+  constructor(opts) {
+    this.opts = opts;
+    const key = openaiApiKey(opts.apiKey);
+    if (!key)
+      throw new Error("OpenAI provider requires OPENAI_API_KEY (or CODEX_API_KEY) to be set");
+    this.apiKey = key;
+    this.baseUrl = (opts.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, "");
+  }
+  async runNode(req) {
+    const { grant, source } = resolveGrant(req.configKey, req.capabilities);
+    const caps = {
+      createFlag: grant.createFlag && this.opts.writer !== void 0,
+      flagState: grant.flagState === true && this.opts.writer !== void 0,
+      createMetric: grant.createMetric && this.opts.writer !== void 0,
+      editFiles: grant.editFiles && this.opts.codeChangesEnabled === true,
+      writeManifest: grant.writeManifest === true && this.opts.codeChangesEnabled === true,
+      stewardManifest: grant.stewardManifest === true && this.opts.codeChangesEnabled === true,
+      queryGraph: grant.queryGraph === true && this.opts.knowledgeGraph !== void 0,
+      querySentry: grant.querySentry === true,
+      readDocs: grant.readDocs === true,
+      queryRepos: grant.queryRepos === true && (this.opts.relatedRepos?.length ?? 0) > 0 && Boolean(this.opts.githubToken ?? process.env.GITHUB_TOKEN)
+    };
+    console.log(`[node] ${req.configKey} grant(${source}): createFlag=${grant.createFlag} editFiles=${grant.editFiles} \u2192 effective createFlag=${caps.createFlag} editFiles=${caps.editFiles} (openai)`);
+    const writer = caps.createFlag || caps.createMetric || caps.flagState ? this.opts.writer : void 0;
+    const model = openaiModelId(req.model);
+    console.log(`[node] ${req.configKey} openai model \u2192 '${model}'${req.model && req.model !== model ? ` (LD: '${req.model}')` : ""}`);
+    const executor = new SandboxToolExecutor(this.opts.sandboxRoot, writer, caps.editFiles, this.opts.prBranch, this.opts.prBaseRef, this.opts.gitMode ?? "push", caps.writeManifest === true && this.opts.codeChangesEnabled === true, caps.stewardManifest === true && this.opts.codeChangesEnabled === true, this.opts.skipCi ?? true);
+    if (caps.queryGraph && this.opts.knowledgeGraph) {
+      executor.provideKnowledgeGraph(this.opts.knowledgeGraph, this.opts.changedFiles ?? []);
+    }
+    if (caps.queryRepos && this.opts.relatedRepos) {
+      executor.provideRelatedRepos(new RelatedReposClient(this.opts.relatedRepos, this.opts.githubToken ?? process.env.GITHUB_TOKEN ?? ""));
+    }
+    const overlay = applyLdToolOverlay(buildSandboxTools(caps), req.ldTools);
+    if (overlay.unknown.length > 0) {
+      console.warn(`[node] ${req.configKey} LD variation attaches tool(s) with no local implementation: ${overlay.unknown.join(", ")} \u2014 ignored`);
+    }
+    const tools = overlay.tools.map((t) => ({
+      type: "function",
+      function: { name: t.name, description: t.description, parameters: t.input_schema }
+    }));
+    const offered = new Set(overlay.tools.map((t) => t.name));
+    const system = (req.instructions ?? "") + modeNote({ ...caps, querySentry: caps.querySentry && offered.has("query_sentry") });
+    const toolCallsUsed = /* @__PURE__ */ new Set();
+    const maxTurns = req.maxTurns ?? DEFAULT_MAX_TURNS2;
+    const messages = [
+      { role: "system", content: system },
+      { role: "user", content: req.prompt }
+    ];
+    let finalText = "";
+    let status = "completed";
+    let inputTokens = 0;
+    let outputTokens = 0;
+    const started = Date.now();
+    const span = startAiSpan(`chat ${req.configKey}`, { op: "gen_ai.chat" });
+    const executeCalls = async (calls) => {
+      const results = [];
+      for (const c6 of calls) {
+        toolCallsUsed.add(c6.function.name);
+        let input = {};
+        try {
+          input = JSON.parse(c6.function.arguments || "{}");
+        } catch {
+        }
+        const r6 = await executor.execute(c6.function.name, input);
+        results.push({
+          role: "tool",
+          tool_call_id: c6.id,
+          // Chat Completions has no is_error flag on tool results — prefix so
+          // the model can't mistake a failure payload for success.
+          content: r6.isError ? `ERROR: ${r6.content}` : r6.content
+        });
+      }
+      return results;
+    };
+    try {
+      for (let turn = 0; turn < maxTurns; turn++) {
+        const resp = await openaiChat(this.apiKey, this.baseUrl, { model, max_completion_tokens: MAX_COMPLETION_TOKENS, messages, tools }, req.configKey);
+        inputTokens += resp.usage?.prompt_tokens ?? 0;
+        outputTokens += resp.usage?.completion_tokens ?? 0;
+        const choice = resp.choices[0];
+        if (!choice)
+          break;
+        messages.push(choice.message);
+        finalText = choice.message.content?.trim() || finalText;
+        if (choice.finish_reason !== "tool_calls" || !choice.message.tool_calls?.length)
+          break;
+        messages.push(...await executeCalls(choice.message.tool_calls));
+        if (turn === maxTurns - 1)
+          status = "stopped";
+      }
+      const missing = missingRequiredTags(req.configKey, executor.tags);
+      if (missing.length > 0) {
+        try {
+          messages.push({
+            role: "user",
+            content: `Before finishing you MUST record your routing decision. You have not set the required tag(s): ${missing.join(", ")}. Call \`tag_conversation\` now with a \`tags\` object, choosing the correct value(s) per your instructions.`
+          });
+          const forced = await openaiChat(this.apiKey, this.baseUrl, {
+            model,
+            max_completion_tokens: MAX_COMPLETION_TOKENS,
+            messages,
+            tools,
+            tool_choice: { type: "function", function: { name: "tag_conversation" } }
+          }, req.configKey);
+          inputTokens += forced.usage?.prompt_tokens ?? 0;
+          outputTokens += forced.usage?.completion_tokens ?? 0;
+          const calls = forced.choices[0]?.message.tool_calls ?? [];
+          if (forced.choices[0])
+            messages.push(forced.choices[0].message);
+          await executeCalls(calls);
+          const stillMissing = missingRequiredTags(req.configKey, executor.tags);
+          console.log(`[node] ${req.configKey} forced tag_conversation for missing [${missing.join(", ")}] \u2192 now ${stillMissing.length ? `still missing [${stillMissing.join(", ")}]` : "all present"}`);
+        } catch (e6) {
+          console.warn(`[node] ${req.configKey} forced tag call failed (non-fatal): ${e6 instanceof Error ? e6.message : e6}`);
+        }
+      }
+      req.tracker?.trackSuccess();
+    } catch (e6) {
+      status = "failed";
+      finalText = e6 instanceof Error ? e6.message : String(e6);
+      req.tracker?.trackError();
+      span.recordException(e6);
+    } finally {
+      req.tracker?.trackDuration(Date.now() - started);
+      if (toolCallsUsed.size > 0) {
+        try {
+          req.tracker?.trackToolCalls([...toolCallsUsed]);
+        } catch {
+        }
+      }
+      if (inputTokens || outputTokens) {
+        req.tracker?.trackTokens({ input: inputTokens, output: outputTokens, total: inputTokens + outputTokens });
+      }
+      span.setGenAi({
+        provider: "openai",
+        requestModel: model,
+        agentName: req.configKey,
+        ...req.tracker ? { tracker: req.tracker } : {},
+        prompt: req.prompt,
+        output: finalText,
+        ...inputTokens || outputTokens ? { usage: { input: inputTokens, output: outputTokens, total: inputTokens + outputTokens } } : {}
+      });
+      span.end(status === "completed" ? "ok" : "error");
+    }
+    return {
+      status,
+      messages: [{ role: "assistant", content: finalText, isFinal: true }],
+      tags: { ...executor.tags }
+    };
+  }
+};
+function openaiModelId(name) {
+  if (!name)
+    return DEFAULT_MODEL2;
+  const id = name.trim().replace(/^openai\./i, "");
+  return id.trim() || DEFAULT_MODEL2;
+}
+
 // ../shared/dist/cursor/cursorModel.js
 function normalizeModelName(name) {
   return name.trim().toLowerCase().replace(/^[a-z]{2}\./, "").replace(/^(anthropic|bedrock|openai|google|cursor)\./, "").replace(/[-_]v\d+(:\d+)?$/, "").replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
@@ -80119,6 +80441,622 @@ Respond with ONLY a single JSON object matching this schema (no prose, no code f
   };
 }
 
+// ../shared/dist/openai/judgeCompletion.js
+var MAX_COMPLETION_TOKENS2 = 16e3;
+function createOpenAiJudgeCompletion(apiKey, baseUrl = "https://api.openai.com/v1") {
+  const key = openaiApiKey(apiKey);
+  if (!key)
+    throw new OpenAiApiError(0, "OpenAI judge requires OPENAI_API_KEY (or CODEX_API_KEY)");
+  return async (req) => {
+    const resp = await openaiChat(key, baseUrl.replace(/\/+$/, ""), {
+      model: openaiModelId(req.model),
+      max_completion_tokens: MAX_COMPLETION_TOKENS2,
+      messages: [
+        { role: "system", content: req.system },
+        { role: "user", content: req.input }
+      ],
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "record_evaluation",
+            description: "Record the evaluation result for the response under review.",
+            parameters: req.schema
+          }
+        }
+      ],
+      tool_choice: { type: "function", function: { name: "record_evaluation" } }
+    }, "judge");
+    const choice = resp.choices[0];
+    const call = choice?.message.tool_calls?.[0];
+    const truncated = choice?.finish_reason === "length";
+    if (truncated) {
+      console.warn(`[judge] completion hit max_completion_tokens (${MAX_COMPLETION_TOKENS2}) \u2014 evaluation discarded as truncated`);
+    }
+    let parsed;
+    if (call && !truncated) {
+      try {
+        parsed = JSON.parse(call.function.arguments || "{}");
+      } catch {
+      }
+    }
+    const ok = parsed !== void 0;
+    return {
+      ...ok ? { parsed } : {},
+      content: truncated ? `judge output truncated at max_completion_tokens=${MAX_COMPLETION_TOKENS2}; partial: ${call?.function.arguments ?? null}` : call?.function.arguments ?? "null",
+      success: ok,
+      tokens: {
+        input: resp.usage?.prompt_tokens ?? 0,
+        output: resp.usage?.completion_tokens ?? 0,
+        total: (resp.usage?.prompt_tokens ?? 0) + (resp.usage?.completion_tokens ?? 0)
+      }
+    };
+  };
+}
+
+// ../shared/dist/github/intake.js
+var MARKER_OPEN = "<!-- autofactory-intent ";
+var MARKER_CLOSE = " -->";
+function parseIntentMarker(body) {
+  if (!body)
+    return void 0;
+  const start = body.indexOf(MARKER_OPEN);
+  if (start === -1)
+    return void 0;
+  const end2 = body.indexOf(MARKER_CLOSE, start + MARKER_OPEN.length);
+  if (end2 === -1)
+    return void 0;
+  try {
+    const parsed = JSON.parse(body.slice(start + MARKER_OPEN.length, end2));
+    if (!parsed || typeof parsed.intent !== "string" || !parsed.intent)
+      return void 0;
+    return parsed;
+  } catch {
+    return void 0;
+  }
+}
+function intentTicketId(body) {
+  return parseIntentMarker(body)?.intent;
+}
+
+// ../shared/dist/jev/client.js
+var JEV_ENDPOINT = "https://api.typesafe.ai/v1/systemone";
+var JEV_DEFAULT_MODEL = "jev-latest";
+var JEV_MAX_CHOICE_OPTIONS = 255;
+var JEV_MAX_SCORE_LEVELS = 10;
+function jevApiKey() {
+  return process.env.TYPESAFE_API_KEY || void 0;
+}
+function validateJevQuestions(questions) {
+  for (const [name, q3] of Object.entries(questions)) {
+    if (q3.type === "choice") {
+      const n3 = Object.keys(q3.criteria).length;
+      if (n3 < 2 || n3 > JEV_MAX_CHOICE_OPTIONS) {
+        throw new Error(`jev: choice '${name}' has ${n3} options (2\u2013${JEV_MAX_CHOICE_OPTIONS})`);
+      }
+    } else if (q3.type === "score") {
+      const n3 = q3.criteria.length;
+      if (n3 < 2 || n3 > JEV_MAX_SCORE_LEVELS) {
+        throw new Error(`jev: score '${name}' has ${n3} levels (2\u2013${JEV_MAX_SCORE_LEVELS})`);
+      }
+    }
+  }
+}
+var RETRYABLE = /* @__PURE__ */ new Set([429, 529, 502, 503]);
+async function askJev(req) {
+  validateJevQuestions(req.questions);
+  const doFetch = req.fetchImpl ?? fetch;
+  const maxRetries = req.maxRetries ?? 3;
+  const body = JSON.stringify({ model: req.model ?? JEV_DEFAULT_MODEL, state: req.state, questions: req.questions });
+  let lastError = "";
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    if (attempt > 0)
+      await new Promise((r6) => setTimeout(r6, 500 * 2 ** (attempt - 1)));
+    let res;
+    try {
+      res = await doFetch(JEV_ENDPOINT, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${req.apiKey}`, "Content-Type": "application/json" },
+        body,
+        signal: AbortSignal.timeout(req.timeoutMs ?? 2e4)
+      });
+    } catch (e6) {
+      lastError = e6 instanceof Error ? e6.message : String(e6);
+      continue;
+    }
+    if (res.ok)
+      return await res.json();
+    const text = (await res.text().catch(() => "")).slice(0, 300);
+    lastError = `HTTP ${res.status}${text ? `: ${text}` : ""}`;
+    if (!RETRYABLE.has(res.status))
+      break;
+  }
+  throw new Error(`jev request failed: ${lastError}`);
+}
+function jevConfidence(answer) {
+  return answer.type === "noul" ? Math.max(answer.noul, 1 - answer.noul) : answer.confidence;
+}
+
+// ../shared/dist/jev/preclassify.js
+import { execFileSync as execFileSync4 } from "node:child_process";
+var JEV_MODE_FLAG_KEY = "auto-factory-jev-mode";
+var JEV_EVENT_KEY = "autofactory-jev-preclassification";
+var JEV_AGREEMENT_EVENT_KEY = "autofactory-jev-agreement";
+var JEV_PREFILL_MIN_CONFIDENCE = 0.7;
+var MAX_DIFF_CHARS = 6e4;
+var MAX_BODY_CHARS = 4e3;
+var MAX_METRIC_QUESTIONS = 60;
+var SKIP_PR_TYPES = /* @__PURE__ */ new Set(["config_change", "dependency_update", "infrastructure", "test_only", "documentation"]);
+async function resolveJevMode(ldClient, context) {
+  if (!jevApiKey())
+    return "off";
+  const v = await ldClient.variation(JEV_MODE_FLAG_KEY, context, "shadow");
+  return v === "off" || v === "prefill" ? v : "shadow";
+}
+function collectChangeEvidence(root6, opts = {}) {
+  const git2 = (args) => execFileSync4("git", args, { cwd: root6, encoding: "utf8", maxBuffer: 64 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] });
+  const name = opts.baseRef || process.env.PR_BASE_REF || "main";
+  for (const ref of [`origin/${name}`, name, "origin/main", "main"]) {
+    let mergeBase;
+    try {
+      mergeBase = git2(["merge-base", ref, "HEAD"]).trim();
+    } catch {
+      continue;
+    }
+    const exclude = [":(exclude)package-lock.json", ":(exclude)yarn.lock", ":(exclude)pnpm-lock.yaml"];
+    const range2 = opts.workingTree ? [mergeBase] : [mergeBase, "HEAD"];
+    const changedFiles = git2(["diff", "--name-only", ...range2]).split("\n").map((l4) => l4.trim()).filter(Boolean);
+    if (opts.workingTree) {
+      for (const f6 of git2(["ls-files", "--others", "--exclude-standard"]).split("\n"))
+        if (f6.trim())
+          changedFiles.push(f6.trim());
+    }
+    const full = git2(["diff", ...range2, "--", ".", ...exclude]);
+    const truncated = full.length > MAX_DIFF_CHARS;
+    return { diff: truncated ? `${full.slice(0, MAX_DIFF_CHARS)}
+\u2026[diff truncated]` : full, changedFiles, truncated };
+  }
+  return void 0;
+}
+var RISK_LEVELS = [
+  "Trivial: docs, tests, comments, or formatting only; no runtime behavior change",
+  "Low: small additive, isolated change (new endpoint, copy change) with a narrow blast radius",
+  "Moderate: modified business logic or shared code with a moderate blast radius",
+  "High: cross-cutting change, API contract change, or data migration",
+  "Critical: touches auth, payments, pricing/totals, or data integrity"
+];
+var RISK_SCORE_AT_LEVEL = [0.1, 0.25, 0.5, 0.75, 0.9];
+function metricQuestionName(key, i6) {
+  return `metric_${i6}_${key.toLowerCase().replace(/[^a-z0-9]+/g, "_").slice(0, 40)}`;
+}
+var DEFAULT_JEV_QUESTIONS = {
+  risk: {
+    type: "score",
+    instructions: "How risky is this change to ship? Score the blast radius of the behavior change, not the line count. Any change to what a customer is charged or shown as a price is at least Moderate.",
+    criteria: RISK_LEVELS
+  },
+  // Mechanical, not a judgment call: "can this be gated and isn't yet", never
+  // "is gating worthwhile" — that takes business context Jev doesn't have. The
+  // pipeline's policy is to flag nearly everything that can be flagged.
+  flag_worthy: {
+    type: "noul",
+    instructions: "Can the behavior this change introduces or modifies be gated at runtime with a LaunchDarkly feature flag, where it is not already gated? Do not judge whether gating is worthwhile \u2014 only whether it is technically possible and not yet done.",
+    criteria: {
+      true: "Yes: the change alters code that runs in production (UI, API endpoints, business logic, runtime configuration reads) and no existing flag evaluation already wraps that changed code",
+      false: "No: nothing gateable changed (only docs, comments, tests, CI/build files, or dependency manifests), or every changed runtime path is already wrapped by an existing flag evaluation"
+    }
+  },
+  pr_type: {
+    type: "choice",
+    instructions: "What kind of change is this?",
+    criteria: {
+      feature: "Adds new functionality or behavior",
+      bugfix: "Fixes incorrect existing behavior",
+      refactor: "Restructures code without changing behavior",
+      config_change: "Changes configuration values only",
+      dependency_update: "Bumps or changes dependencies",
+      infrastructure: "Build, CI, deployment, or infrastructure code",
+      test_only: "Adds or changes tests only",
+      documentation: "Docs or comments only"
+    }
+  },
+  flag_type: {
+    type: "choice",
+    instructions: "If this change is flagged, which kind of flag fits it?",
+    criteria: {
+      release: "Temporary flag to roll out new or changed behavior, removed after full release",
+      kill_switch: "Permanent off-switch for a risky or expensive subsystem",
+      experiment: "A/B test of alternatives measured against a business metric",
+      operational: "Long-lived operational control or tuning (limits, timeouts, modes)"
+    }
+  },
+  flag_action: {
+    type: "choice",
+    instructions: "Which flag action fits this change? Decide mechanically from the diff: look for existing flag evaluations around the changed code. Do not judge whether a flag is worthwhile.",
+    criteria: {
+      create: "The change alters runtime behavior and no existing flag evaluation wraps the changed code: create a fresh flag",
+      ride_existing: "An existing flag evaluation wraps the changed code and the change iterates on that flagged path",
+      extend_variation: "An existing multivariate flag wraps the changed code and the change adds a new alternative to it: add the next variation",
+      child_flag: "The change adds new functionality inside or next to code already wrapped by a flag: create a new flag with the existing one as a prerequisite",
+      none: "Nothing in the change runs at runtime (only docs, comments, tests, CI/build files, or dependency manifests)"
+    }
+  },
+  feature_novelty: {
+    type: "choice",
+    instructions: "Is the behavior this change introduces a new path or a change to an existing one?",
+    criteria: {
+      net_new: "A new path (new endpoint or component) that users without the change never exercise",
+      incremental: "A change to an existing path that both old and new behavior exercise",
+      mixed: "Some surfaces are new, others are changed existing paths"
+    }
+  },
+  metric_backing: {
+    type: "choice",
+    instructions: "How should a guardrail metric for this change be measured, given the telemetry visible in the code?",
+    criteria: {
+      reuse_event: "The code already sends an analytics/track event that measures the affected behavior",
+      reuse_traces: "The affected code is already covered by tracing spans that can back a metric",
+      ride_o11y: "An observability SDK is installed; enabling its instrumentation covers the behavior without new events",
+      instrument_track: "Nothing measures this yet; a new track() event must be added"
+    }
+  },
+  release_method: {
+    type: "choice",
+    instructions: "How should this change be released once merged?",
+    criteria: {
+      immediate: "Turn it on for everyone at once; low risk and nothing meaningful to measure",
+      progressive: "Ramp it up in stages over time without metric-based automatic rollback",
+      guarded: "Ramp it up while monitoring metrics, rolling back automatically on a regression"
+    }
+  }
+};
+function buildPreclassifyQuestions(metrics = [], base = DEFAULT_JEV_QUESTIONS) {
+  const questions = { ...base };
+  const metricByQuestion = /* @__PURE__ */ new Map();
+  metrics.slice(0, MAX_METRIC_QUESTIONS).forEach((m4, i6) => {
+    const name = metricQuestionName(m4.key, i6);
+    metricByQuestion.set(name, m4.key);
+    questions[name] = {
+      type: "noul",
+      instructions: `Could this change plausibly move the metric "${m4.name ?? m4.key}" (key ${m4.key}${m4.kind ? `, ${m4.kind}` : ""})? Yes only if the change touches code that emits or affects what this metric measures.`,
+      criteria: {
+        true: "The change affects the behavior or code path this metric measures",
+        false: "The change is unrelated to this metric"
+      }
+    };
+  });
+  return { questions, metricByQuestion };
+}
+function candidateMetrics(metrics) {
+  return metrics.filter((m4) => !m4.key.startsWith("$ld:ai:") && !m4.key.startsWith("ld_autogen__ai-"));
+}
+var JEV_DECISIONS = [
+  "risk_score",
+  "flag_worthy",
+  "pr_type",
+  "skip_flagging",
+  "flag_type",
+  "flag_action",
+  "feature_novelty",
+  "metric_backing",
+  "release_method"
+];
+function choiceDecision(a6) {
+  if (!a6 || a6.type !== "choice")
+    return void 0;
+  return { value: a6.choice, confidence: a6.confidence, probabilities: a6.probabilities };
+}
+function riskScoreFromLevel(level, levels = RISK_SCORE_AT_LEVEL.length) {
+  if (levels !== RISK_SCORE_AT_LEVEL.length) {
+    const max2 = Math.max(levels - 1, 1);
+    return 0.1 + 0.8 * Math.min(Math.max(level, 0), max2) / max2;
+  }
+  const max = RISK_SCORE_AT_LEVEL.length - 1;
+  const x = Math.min(Math.max(level, 0), max);
+  const lo = Math.floor(x);
+  const hi = Math.min(lo + 1, max);
+  const a6 = RISK_SCORE_AT_LEVEL[lo];
+  const b6 = RISK_SCORE_AT_LEVEL[hi];
+  return a6 + (b6 - a6) * (x - lo);
+}
+function interpretJevAnswers(answers, metricByQuestion) {
+  const decisions = {};
+  const risk = answers.risk;
+  if (risk?.type === "score") {
+    const levels = Object.keys(risk.legend ?? {}).length || RISK_SCORE_AT_LEVEL.length;
+    decisions.risk_score = { value: riskScoreFromLevel(risk.score, levels).toFixed(2), confidence: risk.confidence };
+  }
+  const worthy = answers.flag_worthy;
+  if (worthy?.type === "noul") {
+    decisions.flag_worthy = { value: worthy.noul >= 0.5 ? "true" : "false", confidence: jevConfidence(worthy) };
+  }
+  for (const name of ["pr_type", "flag_type", "flag_action", "feature_novelty", "metric_backing", "release_method"]) {
+    const d6 = choiceDecision(answers[name]);
+    if (d6)
+      decisions[name] = d6;
+  }
+  if (decisions.flag_worthy && decisions.pr_type) {
+    const skip = decisions.flag_worthy.value === "false" && SKIP_PR_TYPES.has(decisions.pr_type.value);
+    decisions.skip_flagging = {
+      value: skip ? "true" : "false",
+      confidence: Math.min(decisions.flag_worthy.confidence, decisions.pr_type.confidence)
+    };
+  }
+  const metrics = [];
+  for (const [q3, key] of metricByQuestion) {
+    const a6 = answers[q3];
+    if (a6?.type === "noul")
+      metrics.push({ key, probability: a6.noul });
+  }
+  metrics.sort((a6, b6) => b6.probability - a6.probability);
+  return { decisions, metrics };
+}
+var JEV_AI_CONFIG_KEY = "autofactory-jev-preclassifier";
+function isJevQuestion(q3) {
+  if (!q3 || typeof q3 !== "object")
+    return false;
+  const { type, instructions, criteria } = q3;
+  if (typeof instructions !== "string" || !criteria || typeof criteria !== "object")
+    return false;
+  if (type === "score")
+    return Array.isArray(criteria) && criteria.every((c6) => typeof c6 === "string");
+  if (type === "noul") {
+    const c6 = criteria;
+    return typeof c6.true === "string" && typeof c6.false === "string";
+  }
+  return type === "choice" && !Array.isArray(criteria);
+}
+async function resolveJevConfig(aiClient, context, variables) {
+  const fallback2 = {
+    source: "code",
+    questions: DEFAULT_JEV_QUESTIONS,
+    minPrefillConfidence: JEV_PREFILL_MIN_CONFIDENCE
+  };
+  let cfg;
+  try {
+    cfg = await aiClient.completionConfig(JEV_AI_CONFIG_KEY, context, { enabled: false }, variables);
+  } catch (e6) {
+    console.warn(`[jev] AI Config '${JEV_AI_CONFIG_KEY}' evaluation failed \u2014 using built-in questions: ${e6 instanceof Error ? e6.message : e6}`);
+    return fallback2;
+  }
+  if (!cfg.enabled) {
+    console.log(`[jev] AI Config '${JEV_AI_CONFIG_KEY}' not found or disabled \u2014 using built-in questions.`);
+    return fallback2;
+  }
+  const tracker = cfg.createTracker?.();
+  const raw = cfg.model?.custom?.questions;
+  const entries = raw && typeof raw === "object" ? Object.entries(raw) : [];
+  const invalid = entries.filter(([, q3]) => !isJevQuestion(q3)).map(([k6]) => k6);
+  if (entries.length === 0 || invalid.length > 0) {
+    console.warn(`[jev] AI Config '${JEV_AI_CONFIG_KEY}' has ${entries.length === 0 ? "no model.custom.questions" : `malformed question(s): ${invalid.join(", ")}`} \u2014 using built-in questions.`);
+    return { ...fallback2, ...tracker ? { tracker } : {} };
+  }
+  const min = Number(cfg.model?.parameters?.minPrefillConfidence);
+  const variation = tracker?.getTrackData().variationKey;
+  return {
+    source: "ai-config",
+    questions: Object.fromEntries(entries),
+    ...cfg.model?.name ? { model: cfg.model.name } : {},
+    minPrefillConfidence: Number.isFinite(min) && min > 0 && min <= 1 ? min : JEV_PREFILL_MIN_CONFIDENCE,
+    ...variation ? { variation } : {},
+    ...tracker ? { tracker } : {}
+  };
+}
+async function runJevPreclassification(input) {
+  const apiKey = input.apiKey ?? jevApiKey();
+  if (!apiKey)
+    return void 0;
+  try {
+    const evidence = collectChangeEvidence(input.root, {
+      ...input.baseRef ? { baseRef: input.baseRef } : {},
+      ...input.workingTree ? { workingTree: true } : {}
+    });
+    if (!evidence || !evidence.diff.trim() && evidence.changedFiles.length === 0) {
+      console.log("[jev] no diff against the base \u2014 pre-classification skipped");
+      return void 0;
+    }
+    const { questions, metricByQuestion } = buildPreclassifyQuestions(candidateMetrics(input.metrics ?? []), input.questions);
+    const state2 = {
+      title: input.title ?? "",
+      description: (input.body ?? "").slice(0, MAX_BODY_CHARS),
+      changed_files: evidence.changedFiles,
+      diff: evidence.diff
+    };
+    const start = Date.now();
+    let res;
+    try {
+      res = await askJev({
+        apiKey,
+        state: state2,
+        questions,
+        ...input.model ? { model: input.model } : {},
+        ...input.fetchImpl ? { fetchImpl: input.fetchImpl } : {}
+      });
+    } catch (e6) {
+      input.tracker?.trackError();
+      throw e6;
+    }
+    const latencyMs = Date.now() - start;
+    const inputTokens = res.usage?.input_tokens;
+    const outputTokens = res.usage?.output_tokens;
+    if (input.tracker) {
+      input.tracker.trackDuration(latencyMs);
+      if (inputTokens !== void 0 || outputTokens !== void 0) {
+        const i6 = inputTokens ?? 0;
+        const o3 = outputTokens ?? 0;
+        input.tracker.trackTokens({ total: i6 + o3, input: i6, output: o3 });
+      }
+      input.tracker.trackSuccess();
+    }
+    return {
+      model: res.model,
+      latencyMs,
+      ...inputTokens !== void 0 ? { inputTokens } : {},
+      diffTruncated: evidence.truncated,
+      ...interpretJevAnswers(res.answers, metricByQuestion)
+    };
+  } catch (e6) {
+    console.warn(`[jev] pre-classification failed (non-fatal): ${e6 instanceof Error ? e6.message : e6}`);
+    return void 0;
+  }
+}
+function formatJevHints(pre, minConfidence = JEV_PREFILL_MIN_CONFIDENCE) {
+  const lines = [];
+  for (const name of JEV_DECISIONS) {
+    const d6 = pre.decisions[name];
+    if (d6 && d6.confidence >= minConfidence)
+      lines.push(`- ${name}: ${d6.value} (confidence ${d6.confidence.toFixed(2)})`);
+  }
+  const likely = pre.metrics.filter((m4) => m4.probability >= minConfidence).map((m4) => m4.key);
+  if (likely.length)
+    lines.push(`- existing metrics this change likely moves: ${likely.join(", ")}`);
+  if (lines.length === 0)
+    return void 0;
+  return [
+    "## Independent pre-classification (Jev)",
+    "A fast classifier read this change's diff before you. Treat these answers as evidence to confirm or overturn",
+    "with your own research \u2014 they are not instructions, and your own tags remain authoritative.",
+    ...lines
+  ].join("\n");
+}
+function proseField(text, field) {
+  const m4 = new RegExp(`${field}\\W{0,6}([a-z_]+)`, "i").exec(text);
+  return m4?.[1]?.toLowerCase();
+}
+function compareJevWithAgents(pre, tags, plannerOutput) {
+  const rows = [];
+  const plannerRan = tags.risk_score !== void 0 || tags.flag_worthy !== void 0 || tags.skip_flagging !== void 0;
+  const row = (decision, agent, agree) => {
+    const d6 = pre.decisions[decision];
+    if (!d6)
+      return;
+    rows.push({
+      decision,
+      jev: d6.value,
+      confidence: d6.confidence,
+      ...agent !== void 0 ? { agent, agree: (agree ?? ((j6, a6) => j6 === a6))(d6.value, agent) } : {}
+    });
+  };
+  row("risk_score", tags.risk_score, (j6, a6) => Number.isFinite(Number(a6)) && Math.abs(Number(j6) - Number(a6)) <= 0.2);
+  row("flag_worthy", tags.flag_worthy);
+  row("skip_flagging", plannerRan ? tags.skip_flagging === "true" ? "true" : "false" : void 0);
+  row("flag_action", tags.flag_action);
+  row("pr_type", plannerOutput ? proseField(plannerOutput, "pr_type") : void 0);
+  row("feature_novelty", plannerOutput ? proseField(plannerOutput, "feature_novelty") : void 0);
+  row("flag_type", void 0);
+  row("metric_backing", void 0);
+  row("release_method", tags.flag_key ? (tags.metric_keys ?? "").trim() ? "guarded" : "progressive" : void 0);
+  const asked = new Set(pre.metrics.map((m4) => m4.key));
+  if (asked.size > 0 && tags.metric_keys !== void 0) {
+    const agentKeys = tags.metric_keys.split(",").map((k6) => k6.trim()).filter((k6) => asked.has(k6));
+    const jevKeys = pre.metrics.filter((m4) => m4.probability >= 0.5).map((m4) => m4.key);
+    const same = agentKeys.length === jevKeys.length && agentKeys.every((k6) => jevKeys.includes(k6));
+    rows.push({
+      decision: "existing_metrics",
+      jev: jevKeys.join(", ") || "(none)",
+      agent: agentKeys.join(", ") || "(none)",
+      agree: same
+    });
+  }
+  return rows;
+}
+function formatJevComparison(pre, rows, mode) {
+  const mark = (r6) => r6.agree === void 0 ? "\u2014" : r6.agree ? "\u2713" : "\u2717";
+  const compared = rows.filter((r6) => r6.agree !== void 0);
+  const agreed = compared.filter((r6) => r6.agree).length;
+  return [
+    `**Jev pre-classification** (${mode}, ${pre.model}, ${pre.latencyMs}ms${pre.inputTokens ? `, ${pre.inputTokens} input tokens` : ""}${pre.diffTruncated ? ", diff truncated" : ""}): agrees with the agents on ${agreed}/${compared.length} compared decisions`,
+    "",
+    "| Decision | Jev | Confidence | Agents | Match |",
+    "|---|---|---|---|---|",
+    ...rows.map((r6) => `| ${r6.decision} | ${r6.jev} | ${r6.confidence !== void 0 ? r6.confidence.toFixed(2) : "\u2014"} | ${r6.agent ?? "\u2014"} | ${mark(r6)} |`)
+  ].join("\n");
+}
+function jevEventData(pre, rows, mode) {
+  return {
+    mode,
+    model: pre.model,
+    latencyMs: pre.latencyMs,
+    inputTokens: pre.inputTokens ?? null,
+    diffTruncated: pre.diffTruncated,
+    decisions: rows.map((r6) => ({
+      decision: r6.decision,
+      jev: r6.jev,
+      confidence: r6.confidence ?? null,
+      agent: r6.agent ?? null,
+      agree: r6.agree ?? null
+    })),
+    metrics: pre.metrics.slice(0, 20)
+  };
+}
+async function startJevLayer(opts) {
+  let mode = "off";
+  try {
+    mode = await resolveJevMode(opts.ldClient, opts.ldContext);
+  } catch (e6) {
+    console.warn(`[jev] mode flag evaluation failed (non-fatal): ${e6 instanceof Error ? e6.message : e6}`);
+  }
+  if (mode === "off") {
+    console.log(`Jev pre-classification: off${jevApiKey() ? ` (${JEV_MODE_FLAG_KEY})` : " (no TYPESAFE_API_KEY)"}.`);
+    return { mode };
+  }
+  let metrics = [];
+  if (opts.listMetrics) {
+    try {
+      metrics = await opts.listMetrics();
+    } catch (e6) {
+      console.warn(`[jev] could not list app-project metrics (non-fatal): ${e6 instanceof Error ? e6.message : e6}`);
+    }
+  }
+  const config = opts.aiClient ? await resolveJevConfig(opts.aiClient, opts.ldContext, opts.variables) : { source: "code", questions: DEFAULT_JEV_QUESTIONS, minPrefillConfidence: JEV_PREFILL_MIN_CONFIDENCE };
+  const pre = await runJevPreclassification({
+    root: opts.root,
+    questions: config.questions,
+    ...config.model ? { model: config.model } : {},
+    ...config.tracker ? { tracker: config.tracker } : {},
+    ...opts.baseRef ? { baseRef: opts.baseRef } : {},
+    ...opts.workingTree ? { workingTree: true } : {},
+    ...typeof opts.context.PR_TITLE === "string" ? { title: opts.context.PR_TITLE } : {},
+    ...typeof opts.context.PR_BODY === "string" ? { body: opts.context.PR_BODY } : {},
+    metrics
+  });
+  if (!pre)
+    return { mode, config };
+  const summary = JEV_DECISIONS.map((n3) => pre.decisions[n3]).map((d6, i6) => d6 ? `${JEV_DECISIONS[i6]}=${d6.value}@${d6.confidence.toFixed(2)}` : "").filter(Boolean).join(" ");
+  const from = config.source === "ai-config" ? `${JEV_AI_CONFIG_KEY}/${config.variation ?? "?"}` : "built-in questions";
+  console.log(`Jev pre-classification: ${mode} \u2014 ${pre.latencyMs}ms, ${pre.model}, ${from}: ${summary}`);
+  if (mode === "prefill") {
+    const hints = formatJevHints(pre, config.minPrefillConfidence);
+    if (hints)
+      opts.context.PRECLASSIFICATION = hints;
+    console.log(`Jev prefill: ${hints ? "confident answers added to the entry node's prompt" : "no answer cleared the confidence bar"}.`);
+  }
+  return { mode, pre, config };
+}
+function finishJevLayer(layer, opts) {
+  if (!layer.pre)
+    return void 0;
+  try {
+    const planner = opts.runs.find((r6) => r6.tags.risk_score !== void 0 || r6.tags.flag_worthy !== void 0);
+    const rows = compareJevWithAgents(layer.pre, opts.tags, planner?.output);
+    const trackData = layer.config?.tracker?.getTrackData();
+    opts.ldClient.track(JEV_EVENT_KEY, opts.ldContext, {
+      ...jevEventData(layer.pre, rows, layer.mode),
+      questionSource: layer.config?.source ?? "code",
+      ...trackData ? { trackData } : {}
+    });
+    const compared = rows.filter((r6) => r6.agree !== void 0);
+    if (compared.length > 0) {
+      const agreement = compared.filter((r6) => r6.agree).length / compared.length;
+      opts.ldClient.track(JEV_AGREEMENT_EVENT_KEY, opts.ldContext, trackData ?? { questionSource: "code" }, agreement);
+    }
+    return formatJevComparison(layer.pre, rows, layer.mode);
+  } catch (e6) {
+    console.warn(`[jev] comparison failed (non-fatal): ${e6 instanceof Error ? e6.message : e6}`);
+    return void 0;
+  }
+}
+
 // src/checkRun.ts
 var CHECK_NAME = "AutoFactory \u2014 Approval gate";
 async function postCheckRun(opts) {
@@ -80352,6 +81290,9 @@ function createAgentRunner(provider, kg) {
       ...process.env.AWS_REGION ? { awsRegion: process.env.AWS_REGION } : {}
     });
   }
+  if (provider === "openai") {
+    return new OpenAiAgentRunner(localOpts);
+  }
   return new AnthropicAgentRunner({
     ...localOpts,
     ...process.env.ANTHROPIC_API_KEY ? { apiKey: process.env.ANTHROPIC_API_KEY } : {}
@@ -80370,6 +81311,9 @@ function createJudgeCompletion(provider) {
   if (provider === "bedrock") {
     return createBedrockJudgeCompletion(process.env.AWS_REGION);
   }
+  if (provider === "openai") {
+    return createOpenAiJudgeCompletion();
+  }
   console.log(`Judges: no local judge execution on provider '${provider}' \u2014 attached judges are skipped.`);
   return void 0;
 }
@@ -80387,7 +81331,7 @@ function flagCreationWriter() {
 }
 function checkoutHeadSha(root6) {
   try {
-    return execFileSync4("git", ["rev-parse", "HEAD"], { cwd: root6, encoding: "utf8" }).trim();
+    return execFileSync5("git", ["rev-parse", "HEAD"], { cwd: root6, encoding: "utf8" }).trim();
   } catch {
     return void 0;
   }
@@ -80408,7 +81352,7 @@ async function reviewManifestIntent(opts) {
         manifest.releaseIntent = rawIntent;
         writeFileSync2(abs, JSON.stringify(manifest, null, 2) + "\n", "utf8");
         try {
-          const git2 = (args) => execFileSync4("git", args, { cwd: opts.sandboxRoot, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+          const git2 = (args) => execFileSync5("git", args, { cwd: opts.sandboxRoot, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
           git2(["config", "user.email", "autofactory@launchdarkly.com"]);
           git2(["config", "user.name", "LaunchDarkly AutoFactory"]);
           git2(["add", rel]);
@@ -80446,15 +81390,25 @@ function describeStall(stall) {
   const edges = stall.unmet.map((u) => `edge \u2192 ${u.target} requires ${Object.entries(u.requireMissing).map(([k6, v]) => `${k6}=${v}`).join(", ")} (never produced)`).join("; ");
   return `chain stalled at '${stall.node}'; ${edges}. Downstream agents did not run.`;
 }
-function gateStatusLine(pendingNode, reworked, inventory) {
-  const created = [
+function priorCreations(inventory) {
+  return [
     inventory.flag_key ? `flag \`${inventory.flag_key}\`` : "",
     inventory.metric_keys ? `metric(s) \`${inventory.metric_keys}\`` : ""
   ].filter(Boolean);
+}
+function gateStatusLine(pendingNode, reworked, inventory) {
+  const created = priorCreations(inventory);
   if (reworked && created.length) {
     return `The chain paused before **${pendingNode}**. A prior iteration already created ${created.join(" and ")}; approving may re-run this step (up to its \`max_visits\` budget) against new input.`;
   }
   return `The chain paused before **${pendingNode}**. Nothing was created for this or later steps yet.`;
+}
+function inputStatusLine(node, reworked, inventory) {
+  const created = priorCreations(inventory);
+  if (reworked && created.length) {
+    return `\`${node}\` paused the chain on a question it could not answer from the repo. A prior iteration already created ${created.join(" and ")}; this pass created nothing new and later steps did not run.`;
+  }
+  return `\`${node}\` paused the chain on a question it could not answer from the repo. Nothing was created for this or later steps.`;
 }
 function buildGateComment(gatedSteps, approved, pendingNode, statusLine) {
   const lines = gatedSteps.map((step) => {
@@ -80478,7 +81432,9 @@ function buildVariables(ctx) {
     PR_BODY: ctx.PR_BODY ?? "",
     REPO: ctx.REPO ?? "",
     PR_BRANCH: process.env.PR_BRANCH ?? "",
-    TICKET_ID: process.env.TICKET_ID ?? "",
+    // The intent marker in the PR body (issue intake, ADR 0019) supplies the
+    // ticket when the workflow doesn't set one — the join key for both runs.
+    TICKET_ID: process.env.TICKET_ID ?? intentTicketId(ctx.PR_BODY) ?? "",
     LAUNCHDARKLY_PROJECT: process.env.LD_APP_PROJECT_KEY ?? "autofactory-demo"
   };
 }
@@ -80496,6 +81452,7 @@ function mapActionInputs() {
   set("AWS_SESSION_TOKEN", "aws_session_token");
   set("CURSOR_API_KEY", "cursor_api_key");
   set("CURSOR_MODEL", "cursor_model");
+  set("TYPESAFE_API_KEY", "typesafe_api_key");
   set("LD_API_KEY", "ld_api_key");
   set("LD_BASE_URL", "ld_base_url");
   set("LD_PROJECT_KEY", "ld_project_key");
@@ -80541,8 +81498,27 @@ async function main() {
   const context = assemblePrContext();
   await initFactorySentry({ serviceName: "auto-factory-phase1-gha" });
   const { ldClient, aiClient } = await getLdSdk();
+  process.env.AUTOFACTORY_SURFACE ||= "github-action";
   let ldContext = pipelineContext();
-  const provider = await resolveAiProvider(ldClient, ldContext);
+  const intentMarker = parseIntentMarker(context.PR_BODY);
+  const ticketId = process.env.TICKET_ID || intentMarker?.intent;
+  ldContext = withRunAttributes(ldContext, {
+    entry: "pr",
+    pr: context.PR_NUMBER,
+    repo: context.REPO,
+    ticket: ticketId,
+    intake_run: intentMarker?.intakeRun
+  });
+  if (ticketId) console.log(`Intent: ${ticketId}${intentMarker?.intakeRun ? ` (opened by intake run ${intentMarker.intakeRun})` : ""}`);
+  let provider = await resolveAiProvider(ldClient, ldContext);
+  if (provider === "cursor" && !process.env.CURSOR_API_KEY) {
+    console.log("Provider flag selects 'cursor' but CURSOR_API_KEY is not set \u2014 falling back to Anthropic.");
+    provider = "anthropic";
+  }
+  if (provider === "openai" && !process.env.OPENAI_API_KEY && !process.env.CODEX_API_KEY) {
+    console.log("Provider flag selects 'openai' but OPENAI_API_KEY/CODEX_API_KEY is not set \u2014 falling back to Anthropic.");
+    provider = "anthropic";
+  }
   ldContext = withProvider(ldContext, provider);
   const graphKey = process.env.GRAPH_KEY ?? "gha-auto-factory";
   const graphDef = await aiClient.agentGraph(graphKey, ldContext, buildVariables(context));
@@ -80616,7 +81592,21 @@ async function main() {
   } : void 0;
   const verifierWriter = flagCreationWriter();
   const verifier = buildHandoffVerifier({ sandboxRoot, ...verifierWriter ? { writer: verifierWriter } : {} });
+  const metricsReader = verifierWriter ?? (process.env.LD_API_KEY && process.env.LD_APP_PROJECT_KEY ? new LdResourceWriter(new LdClient(appConnection())) : void 0);
+  const jev = await startJevLayer({
+    ldClient,
+    ldContext,
+    aiClient,
+    variables: buildVariables(context),
+    context,
+    root: sandboxRoot,
+    ...process.env.PR_BASE_REF ? { baseRef: process.env.PR_BASE_REF } : {},
+    ...metricsReader ? { listMetrics: () => metricsReader.listMetrics() } : {}
+  });
   const walk2 = await walkGraph(graphDef, runner, context, { graphTracker, gate, judgeHook, verifier });
+  const jevTable = finishJevLayer(jev, { ldClient, ldContext, tags: walk2.tags, runs: walk2.runs });
+  if (jevTable) console.log(`
+${jevTable}`);
   for (const r6 of walk2.runs) {
     console.log(`
 \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 ${r6.configKey} [${r6.status}] \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550`);
@@ -80652,6 +81642,30 @@ async function main() {
       conclusion: "action_required",
       title: `Approval required before ${node}`,
       summary: `${statusLine} Add the PR label \`${label}\` to approve; the chain resumes on the next run.`
+    });
+    return;
+  }
+  if (walk2.pendingInput) {
+    const { node, question } = walk2.pendingInput;
+    const manifestPath = context.PR_NUMBER ? `.release-flags/pr-${context.PR_NUMBER}.json` : ".release-flags/<pr>.json";
+    console.log(`::warning::AutoFactory: '${node}' paused with a question for a human${question ? `: ${question}` : ""}.`);
+    await postPrComment(
+      [
+        `## \u23F8 AutoFactory needs a human answer`,
+        "",
+        inputStatusLine(node, walk2.runs.some((r6) => r6.iteration > 1), walk2.inventory),
+        "",
+        ...question ? [`> ${question}`, ""] : [],
+        `**To answer:** edit \`${manifestPath}\` on this branch and set \`"humanInput": {"answer": "..."}\` (the agent's full analysis is in the run log). Pushing the edit re-runs the chain, which reads your answer and continues.`
+      ].join("\n"),
+      { prNumber: context.PR_NUMBER, repo: context.REPO }
+    );
+    await postCheckRun({
+      repo: context.REPO,
+      headSha: context.HEAD_SHA,
+      conclusion: "action_required",
+      title: `Human answer needed by ${node}`,
+      summary: `The chain paused on a question from \`${node}\`${question ? `: ${question}` : ""}. Answer in \`${manifestPath}\` \u2192 \`humanInput.answer\` and push; the chain resumes on the next run.`
     });
     return;
   }
@@ -80708,7 +81722,8 @@ async function main() {
     "",
     "| Agent | Status | Judge | Tags |",
     "|---|---|---|---|",
-    ...agentRows.length ? agentRows : ["| (none ran) | \u2014 | \u2014 | \u2014 |"]
+    ...agentRows.length ? agentRows : ["| (none ran) | \u2014 | \u2014 | \u2014 |"],
+    ...jevTable ? ["", "<details><summary>Jev pre-classification</summary>", "", jevTable, "", "</details>"] : []
   ].filter(Boolean).join("\n");
   await postPrComment(summary, { prNumber: context.PR_NUMBER, repo: context.REPO });
   await postCheckRun({

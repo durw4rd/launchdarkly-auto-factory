@@ -97,11 +97,12 @@ try {
   }
 
   // Only outward-bound PR actions are gated: `git`/`gh` must sit at a command
-  // position (start, or after && ; | etc.), and `push` must be git's
+  // position (start, or after && ; | etc., optionally behind env assignments —
+  // `FOO=1 git push` must not slip past the gate), and `push` must be git's
   // SUBCOMMAND (allowing global options like -C <dir> / --no-pager before
   // it) — so `git stash push`, `echo git push`, and commit messages that
   // mention pushing all pass through.
-  const cmdPos = String.raw`(?:^|[;&|(]\s*|\n\s*)`;
+  const cmdPos = String.raw`(?:^|[;&|(]\s*|\n\s*)(?:\w+=\S*\s+)*`;
   const isGitPush = new RegExp(`${cmdPos}git\\s+(?:-[cC]\\s+\\S+\\s+|--?\\S+\\s+)*push\\b`).test(command);
   const isPrCreate = new RegExp(`${cmdPos}gh\\s+pr\\s+create\\b`).test(command);
   if (!isGitPush && !isPrCreate) {
