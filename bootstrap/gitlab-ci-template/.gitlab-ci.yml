@@ -17,9 +17,11 @@
 
 workflow:
   rules:
-    # Belt and braces against loops: never run for the bot's own commits.
-    - if: $CI_COMMIT_AUTHOR =~ /autofactory@launchdarkly\.com/
-      when: never
+    # No author-based loop guard: the head is often the bot's own commit (the
+    # manifest lands before an approval gate), and "skip bot-authored heads"
+    # would skip the human's Run pipeline that resumes past the gate. Loops are
+    # already impossible: job-token pushes start no pipeline, and the agents'
+    # commits carry [skip ci].
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
 
 autofactory:
