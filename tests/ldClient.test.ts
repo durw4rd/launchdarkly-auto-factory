@@ -109,6 +109,66 @@ describe("LdClient", () => {
     assert.equal(attempts, 2);
   });
 
+  it("keeps the full 429 budget after earlier 5xx retries", async () => {
+    let attempts = 0;
+    const origWarn = console.warn;
+    console.warn = () => {};
+    const restore = withFetch((async () => {
+      attempts += 1;
+      return attempts <= 2
+        ? new Response("{}", { status: 500, headers: { "Retry-After": "0.01" } })
+        : new Response('{"code":"rate_limited"}', { status: 429, headers: { "Retry-After": "0.01" } });
+    }) as unknown as typeof fetch);
+
+    await assert.rejects(() => new LdClient(conn).getFlag("f"), (e: unknown) => {
+      assert.equal((e as LdApiError).status, 429);
+      assert.equal((e as LdApiError).attempts, 9); // 2 × 500, then initial 429 + RATE_LIMIT_RETRIES
+      return true;
+    });
+    restore();
+    console.warn = origWarn;
+    assert.equal(attempts, 9);
+  });
+
+  it("counts 429 retries in the reported attempts", async () => {
+    let attempts = 0;
+    const warnings: string[] = [];
+    const origWarn = console.warn;
+    console.warn = (msg: string) => warnings.push(msg);
+    const restore = withFetch((async () => {
+      attempts += 1;
+      return attempts === 1
+        ? new Response('{"code":"rate_limited"}', { status: 429, headers: { "Retry-After": "0.01" } })
+        : new Response("{}", { status: 500, headers: { "Retry-After": "0.01" } });
+    }) as unknown as typeof fetch);
+
+    await assert.rejects(() => new LdClient(conn).getFlag("f"), (e: unknown) => {
+      assert.equal((e as LdApiError).attempts, 4); // 429, then 500 + SERVER_ERROR_RETRIES
+      return true;
+    });
+    restore();
+    console.warn = origWarn;
+    assert.equal(attempts, 4);
+    assert.match(warnings[0] ?? "", /after 4 attempt\(s\)/);
+  });
+
+  it("honors an HTTP-date Retry-After on a 5xx instead of the 1s fallback", async () => {
+    let attempts = 0;
+    const t0 = Date.now();
+    const restore = withFetch((async () => {
+      attempts += 1;
+      return attempts === 1
+        ? new Response("{}", { status: 503, headers: { "Retry-After": new Date(Date.now() - 5000).toUTCString() } })
+        : new Response('{"key":"f"}', { status: 200 });
+    }) as unknown as typeof fetch);
+
+    const res = await new LdClient(conn).getFlag<{ key: string }>("f");
+    restore();
+    assert.equal(res.status, 200);
+    assert.equal(attempts, 2);
+    assert.ok(Date.now() - t0 < 500, "a past HTTP-date means retry now, not after the 1s fallback");
+  });
+
   it("never retries a 5xx on PATCH (a semantic patch could apply twice)", async () => {
     let attempts = 0;
     const origWarn = console.warn;

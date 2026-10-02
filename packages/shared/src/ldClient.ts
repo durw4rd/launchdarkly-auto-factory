@@ -45,13 +45,26 @@ const LOGGED_BODY_CHARS = 2000;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /**
- * How long to wait before retrying a 429. Prefers `Retry-After` (seconds),
- * falls back to `X-Ratelimit-Reset` (epoch ms), else a fixed backoff.
+ * `Retry-After` in ms, accepting both forms RFC 9110 allows: delay-seconds
+ * ("2") and an HTTP-date. Undefined when absent or unparseable.
+ */
+function retryAfterMs(res: Response): number | undefined {
+  const raw = res.headers.get("retry-after")?.trim();
+  if (!raw) return undefined;
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds)) return seconds > 0 ? seconds * 1000 : undefined;
+  const at = Date.parse(raw);
+  return Number.isNaN(at) ? undefined : Math.max(at - Date.now(), 0);
+}
+
+/**
+ * How long to wait before retrying a 429. Prefers `Retry-After`, falls back
+ * to `X-Ratelimit-Reset` (epoch ms), else a fixed backoff.
  */
 function backoffMs(res: Response): number {
-  const retryAfter = Number(res.headers.get("retry-after"));
-  if (Number.isFinite(retryAfter) && retryAfter > 0) {
-    return Math.min(retryAfter * 1000, MAX_BACKOFF_MS);
+  const retryAfter = retryAfterMs(res);
+  if (retryAfter !== undefined) {
+    return Math.min(retryAfter, MAX_BACKOFF_MS);
   }
   const reset = Number(res.headers.get("x-ratelimit-reset"));
   if (Number.isFinite(reset) && reset > 0) {
@@ -61,12 +74,12 @@ function backoffMs(res: Response): number {
 }
 
 /** Retry-After when the server sends one, else 1s, 2s, … */
-function serverErrorBackoffMs(res: Response, attempt: number): number {
-  const retryAfter = Number(res.headers.get("retry-after"));
-  if (Number.isFinite(retryAfter) && retryAfter > 0) {
-    return Math.min(retryAfter * 1000, MAX_BACKOFF_MS);
+function serverErrorBackoffMs(res: Response, retry: number): number {
+  const retryAfter = retryAfterMs(res);
+  if (retryAfter !== undefined) {
+    return Math.min(retryAfter, MAX_BACKOFF_MS);
   }
-  return 1000 * 2 ** attempt;
+  return 1000 * 2 ** retry;
 }
 
 function isRetryableOnServerError(opts: LdRequestOptions): boolean {
@@ -83,8 +96,13 @@ export class LdClient {
 
   async request<T = unknown>(opts: LdRequestOptions): Promise<LdResponse<T>> {
     let res!: Response;
-    let serverErrors = 0;
-    for (let attempt = 0; ; attempt++) {
+    // Separate budgets so 5xx retries never eat into the 429 allowance (and
+    // vice versa); `attempts` counts every HTTP call for diagnostics.
+    let rateLimitRetries = 0;
+    let serverErrorRetries = 0;
+    let attempts = 0;
+    for (;;) {
+      attempts += 1;
       res = await fetch(`${this.conn.baseUrl}${opts.path}`, {
         method: opts.method ?? "GET",
         headers: {
@@ -95,13 +113,14 @@ export class LdClient {
         },
         body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
       });
-      if (res.status === 429 && attempt < RATE_LIMIT_RETRIES) {
+      if (res.status === 429 && rateLimitRetries < RATE_LIMIT_RETRIES) {
         await sleep(backoffMs(res));
+        rateLimitRetries += 1;
         continue;
       }
-      if (res.status >= 500 && serverErrors < SERVER_ERROR_RETRIES && isRetryableOnServerError(opts)) {
-        await sleep(serverErrorBackoffMs(res, serverErrors));
-        serverErrors += 1;
+      if (res.status >= 500 && serverErrorRetries < SERVER_ERROR_RETRIES && isRetryableOnServerError(opts)) {
+        await sleep(serverErrorBackoffMs(res, serverErrorRetries));
+        serverErrorRetries += 1;
         continue;
       }
       break;
@@ -125,11 +144,11 @@ export class LdClient {
         // keep the request on record so the next look isn't guesswork.
         const sent = opts.body === undefined ? "(none)" : JSON.stringify(opts.body).slice(0, LOGGED_BODY_CHARS);
         console.warn(
-          `[ld-api] ${method} ${opts.path} → HTTP ${res.status} after ${serverErrors + 1} attempt(s). ` +
+          `[ld-api] ${method} ${opts.path} → HTTP ${res.status} after ${attempts} attempt(s). ` +
             `Response: ${text.slice(0, LOGGED_BODY_CHARS) || "(empty)"} Request body: ${sent}`,
         );
       }
-      throw new LdApiError(method, opts.path, res.status, data, serverErrors + 1);
+      throw new LdApiError(method, opts.path, res.status, data, attempts);
     }
     return { status: res.status, ok, data: data as T };
   }
@@ -367,7 +386,7 @@ export class LdApiError extends Error {
     readonly path: string,
     readonly status: number,
     readonly responseBody: unknown,
-    /** Attempts made, including 5xx retries (1 = no retry). */
+    /** HTTP calls made, including 429 and 5xx retries (1 = no retry). */
     readonly attempts = 1,
   ) {
     super(
