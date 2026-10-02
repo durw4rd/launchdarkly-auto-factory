@@ -42,12 +42,22 @@ export interface HandoffVerification {
   ok: boolean;
   passed: HandoffCheck[];
   failures: HandoffCheck[];
+  /**
+   * LaunchDarkly resources an earlier node or pass in this walk created, re-read
+   * now. A report restates them — a rework pass especially — but its own tags
+   * don't claim them (no create call this pass), so without these lines a judge
+   * sees them as unverifiable. Evidence only: never affects `ok` — a node isn't failed for a
+   * claim it didn't make. Each entry's own `ok` is its ✓ / ✗.
+   */
+  carried?: Array<HandoffCheck & { ok: boolean }>;
 }
 
 /** Runs after a node completes; null = no deterministic checks applied to this node. */
 export type HandoffVerifier = (run: {
   configKey: string;
   tags: Record<string, string>;
+  /** The walk's never-rewound resource facts so far (graphWalker's inventory), incl. this run's. */
+  inventory?: Record<string, string>;
 }) => Promise<HandoffVerification | null>;
 
 const SKIP_DIRS = new Set(["node_modules", ".git", "dist", "build", "__pycache__", ".venv", ".release-flags"]);
@@ -239,7 +249,58 @@ export function buildHandoffVerifier(opts: HandoffVerifierOptions): HandoffVerif
       passed.push({ name: "tests-green-at-handoff", detail: "last run_tests execution passed" });
     }
 
-    if (passed.length === 0 && failures.length === 0) return null;
-    return { node: run.configKey, ok: failures.length === 0, passed, failures };
+    // ---- Resources carried from earlier passes (evidence only) -------------
+    const carried: Array<HandoffCheck & { ok: boolean }> = [];
+    const inv = run.inventory ?? {};
+    if (opts.writer) {
+      const writer = opts.writer;
+      const carry = async (name: string, read: () => Promise<boolean>, okDetail: string, failDetail: string) => {
+        try {
+          const ok = await read();
+          carried.push({ name, ok, detail: ok ? okDetail : failDetail });
+        } catch (e) {
+          carried.push({ name, ok: false, detail: `could not re-read: ${e instanceof Error ? e.message : String(e)}` });
+        }
+      };
+      const flagKey = inv.flag_key;
+      if (flagKey && !(t.flag_ready === "true" && t.flag_key)) {
+        const variation = inv.flag_variation ?? "";
+        let state: Awaited<ReturnType<LdResourceWriter["getFlagState"]>> | undefined;
+        await carry(
+          "flag-exists-in-ld",
+          async () => (state = await writer.getFlagState(flagKey)).exists,
+          `'${flagKey}' exists in project '${writer.projectKey}'`,
+          `'${flagKey}' does NOT exist in project '${writer.projectKey}'`,
+        );
+        if (state?.exists && variation) {
+          const s = state;
+          await carry(
+            "variation-exists-in-ld",
+            async () => s.variations.some((v) => v.value === variation),
+            `variation '${variation}' exists on '${flagKey}'`,
+            `variation '${variation}' does NOT exist on '${flagKey}'`,
+          );
+        }
+      }
+      const own = new Set((t.metric_keys ?? "").split(",").filter(Boolean));
+      for (const metricKey of (inv.metric_keys ?? "").split(",").filter(Boolean)) {
+        if (own.has(metricKey)) continue;
+        await carry(
+          "metric-exists-in-ld",
+          () => writer.metricExists(metricKey),
+          `metric '${metricKey}' exists in project '${writer.projectKey}'`,
+          `metric '${metricKey}' does NOT exist in project '${writer.projectKey}'`,
+        );
+      }
+    }
+
+    if (passed.length === 0 && failures.length === 0 && carried.length === 0) return null;
+    return {
+      node: run.configKey,
+      ok: failures.length === 0,
+      passed,
+      failures,
+      ...(carried.length > 0 ? { carried } : {}),
+    };
   };
 }

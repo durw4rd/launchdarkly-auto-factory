@@ -488,6 +488,30 @@ describe("routing contract: deterministic handoff shims halt the walk", () => {
     assert.deepEqual(w.runs.at(-1)?.judgeScores, { j: 0.4 }, "the failing run keeps its quality score");
   });
 
+  it("the verifier receives the walk's inventory, so later steps can re-read earlier resources", async () => {
+    const seen: Record<string, Record<string, string> | undefined> = {};
+    const verifier = async (run: { configKey: string; tags: Record<string, string>; inventory?: Record<string, string> }) => {
+      seen[run.configKey] = run.inventory;
+      return null;
+    };
+    await walkGraph(
+      buildChain(),
+      new FakeRunner({
+        [KEYS.research]: { tags: { flag_worthy: "true" } },
+        [KEYS.flag]: { tags: { flag_ready: "true", flag_key: "enable-x", flag_variation: "v1" } },
+        [KEYS.metrics]: { tags: { metrics_created: "true", metric_keys: "m1" } },
+      }),
+      { PR_NUMBER: "1" },
+      { verifier },
+    );
+    assert.equal(seen[KEYS.research]?.flag_key, undefined);
+    assert.deepEqual(
+      { flag_key: seen[KEYS.metrics]?.flag_key, metric_keys: seen[KEYS.metrics]?.metric_keys },
+      { flag_key: "enable-x", metric_keys: "m1" },
+      "the metrics step sees the implementer's flag and its own metrics",
+    );
+  });
+
   it("a FAILED run is not verified — the walk reports the error, not an unverified claim", async () => {
     // Every shim trigger is a TOOL-set tag, so a run that errors late carries them: the real
     // `tests_last_run: "fail"` shim fails unconditionally, which an agent whose suite went red and
