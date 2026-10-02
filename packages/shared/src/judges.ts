@@ -33,6 +33,7 @@ import {
   type RunnerResult,
 } from "@launchdarkly/server-sdk-ai";
 import { startAiSpan } from "./observability.js";
+import type { HandoffVerification } from "./handoffVerifier.js";
 
 /** One structured single-shot completion, supplied per provider. */
 export interface JudgeCompletionRequest {
@@ -141,6 +142,13 @@ export interface JudgeHookArgs {
   output: string;
   /** The evaluated node's tracker — judge results record here (per-variation). */
   tracker: LDAIConfigTracker;
+  /**
+   * The node's deterministic handoff checks (handoffVerifier.ts), run before the
+   * judges. Their results join the VERIFIED EVIDENCE section: they re-read the
+   * LaunchDarkly-side claims (flag, variation, metrics exist) that no git diff
+   * can show, so a judge isn't forced to treat those claims as unverifiable.
+   */
+  verification?: HandoffVerification;
 }
 
 /** Runs every judge attached to a node; returns all results (sampled or not). */
@@ -184,8 +192,22 @@ function samplingRateOf(j: Record<string, unknown>): number {
   return raw > 1 ? raw / 100 : raw;
 }
 
+/**
+ * The deterministic checks as judge evidence. Each line is a claim the pipeline
+ * re-derived itself — ✓ verified, ✗ contradicted — from the LaunchDarkly API or
+ * the checkout. Undefined when no checks applied to the node.
+ */
+export function formatVerificationEvidence(verification: HandoffVerification | undefined): string | undefined {
+  if (!verification || verification.passed.length + verification.failures.length === 0) return undefined;
+  return [
+    "DETERMINISTIC CHECKS (re-derived by the pipeline from the LaunchDarkly API and the checkout):",
+    ...verification.passed.map((c) => `✓ ${c.name}: ${c.detail}`),
+    ...verification.failures.map((c) => `✗ ${c.name}: ${c.detail}`),
+  ].join("\n");
+}
+
 export function createJudgeHook(opts: CreateJudgeHookOptions): JudgeHook {
-  return async ({ configKey, cfg, input, output, tracker }) => {
+  return async ({ configKey, cfg, input, output, tracker, verification }) => {
     const attachments = cfg.judgeConfiguration?.judges ?? [];
     const results: LDJudgeResult[] = [];
     if (attachments.length === 0) return results;
@@ -194,16 +216,20 @@ export function createJudgeHook(opts: CreateJudgeHookOptions): JudgeHook {
     // the judge input — it lands inside the MESSAGE HISTORY block the SDK Judge
     // builds, clearly delimited as pipeline-gathered rather than agent-claimed.
     let judgeInput = input;
+    const sections: string[] = [];
     if (opts.evidence) {
       try {
         const evidence = await opts.evidence(configKey);
-        if (evidence) {
-          judgeInput =
-            `${input}\n\n--- VERIFIED EVIDENCE (gathered by the pipeline, NOT claimed by the agent) ---\n${evidence}`;
-        }
+        if (evidence) sections.push(evidence);
       } catch (e) {
         console.warn(`[judge] ${configKey}: evidence gathering failed (non-fatal): ${e instanceof Error ? e.message : e}`);
       }
+    }
+    const checks = formatVerificationEvidence(verification);
+    if (checks) sections.push(checks);
+    if (sections.length > 0) {
+      judgeInput =
+        `${input}\n\n--- VERIFIED EVIDENCE (gathered by the pipeline, NOT claimed by the agent) ---\n${sections.join("\n\n")}`;
     }
 
     for (const attachment of attachments) {

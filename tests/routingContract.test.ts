@@ -452,6 +452,42 @@ describe("routing contract: deterministic handoff shims halt the walk", () => {
     assert.ok(w.skipped.includes(KEYS.metrics));
   });
 
+  it("checks run BEFORE the judges and reach them as evidence; a failing check still halts after judging", async () => {
+    const order: string[] = [];
+    const verifier = async (run: { configKey: string; tags: Record<string, string> }) => {
+      order.push(`verify:${run.configKey}`);
+      return run.tags.flag_ready === "true"
+        ? {
+            node: run.configKey,
+            ok: false,
+            passed: [{ name: "flag-exists-in-ld", detail: "'enable-x' exists in project 'app'" }],
+            failures: [{ name: "variation-wired-in-code", detail: "'v1' never appears" }],
+          }
+        : null;
+    };
+    const seen: Record<string, string[] | undefined> = {};
+    const judgeHook = async (args: { configKey: string; verification?: { passed: Array<{ name: string }> } }) => {
+      order.push(`judge:${args.configKey}`);
+      seen[args.configKey] = args.verification?.passed.map((c) => c.name);
+      return [{ judgeConfigKey: "j", sampled: true, success: true, score: 0.4 }] as never;
+    };
+    const w = await walkGraph(
+      buildChain(),
+      new FakeRunner({
+        [KEYS.research]: { tags: { flag_worthy: "true" } },
+        [KEYS.flag]: { tags: { flag_ready: "true", flag_key: "enable-x" } },
+      }),
+      { PR_NUMBER: "1" },
+      { verifier, judgeHook: judgeHook as never },
+    );
+    assert.deepEqual(order, [`verify:${KEYS.research}`, `judge:${KEYS.research}`, `verify:${KEYS.flag}`, `judge:${KEYS.flag}`]);
+    assert.deepEqual(seen[KEYS.flag], ["flag-exists-in-ld"], "the judge got the check results");
+    assert.equal(seen[KEYS.research], undefined, "no checks applied → no verification passed");
+    assert.equal(w.verificationFailed?.node, KEYS.flag, "still halts on the failed check");
+    assert.deepEqual(path(w), [KEYS.research, KEYS.flag]);
+    assert.deepEqual(w.runs.at(-1)?.judgeScores, { j: 0.4 }, "the failing run keeps its quality score");
+  });
+
   it("a FAILED run is not verified — the walk reports the error, not an unverified claim", async () => {
     // Every shim trigger is a TOOL-set tag, so a run that errors late carries them: the real
     // `tests_last_run: "fail"` shim fails unconditionally, which an agent whose suite went red and

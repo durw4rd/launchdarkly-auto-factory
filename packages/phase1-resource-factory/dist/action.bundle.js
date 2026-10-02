@@ -72146,6 +72146,13 @@ var LdClient = class {
       okStatuses: [409]
     });
   }
+  /** GET one metric. Returns status 404 (not throwing) when it doesn't exist. */
+  getMetric(metricKey) {
+    return this.request({
+      path: `/api/v2/metrics/${this.conn.projectKey}/${encodeURIComponent(metricKey)}`,
+      okStatuses: [404]
+    });
+  }
   /** List metrics in the project (paginated; caller filters). */
   listMetrics(limit2 = 100) {
     return this.request({
@@ -75137,12 +75144,35 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
     }
     runs.push(run);
     onEvent?.({ type: "node-complete", configKey: key, index: runs.length - 1, run });
+    let verification = null;
+    if (verifier && !replaying && result.status !== "failed") {
+      try {
+        verification = await verifier({ configKey: key, tags: result.tags });
+        if (verification) {
+          onEvent?.({ type: "node-verified", verification });
+          for (const c6 of verification.passed)
+            console.log(`[verify] ${key} \u2713 ${c6.name}: ${c6.detail}`);
+          for (const c6 of verification.failures)
+            console.error(`[verify] ${key} \u2717 ${c6.name}: ${c6.detail}`);
+        }
+      } catch (e6) {
+        console.warn(`[verify] shim errored for '${key}' (non-fatal): ${e6 instanceof Error ? e6.message : e6}`);
+      }
+    }
     if (judgeHook && result.status === "failed") {
       console.log(`[judge] ${key}: node failed (infra/API error) \u2014 judges skipped, no score recorded`);
     } else if (judgeHook && tracker) {
       let judgeResults = [];
       try {
-        judgeResults = await judgeHook({ configKey: key, iteration, cfg, input: prompt, output, tracker });
+        judgeResults = await judgeHook({
+          configKey: key,
+          iteration,
+          cfg,
+          input: prompt,
+          output,
+          tracker,
+          ...verification ? { verification } : {}
+        });
       } catch (e6) {
         console.warn(`[judge] hook failed for '${key}' (non-fatal): ${e6 instanceof Error ? e6.message : e6}`);
       }
@@ -75159,23 +75189,9 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
         console.warn(`[judge] '${key}' has a judge-driven loop edge but produced NO usable score (unsampled, failed, or no judge attached) \u2014 the quality loop cannot fire and this run is unverified.`);
       }
     }
-    if (verifier && !replaying && result.status !== "failed") {
-      try {
-        const verification = await verifier({ configKey: key, tags: result.tags });
-        if (verification) {
-          onEvent?.({ type: "node-verified", verification });
-          for (const c6 of verification.passed)
-            console.log(`[verify] ${key} \u2713 ${c6.name}: ${c6.detail}`);
-          for (const c6 of verification.failures)
-            console.error(`[verify] ${key} \u2717 ${c6.name}: ${c6.detail}`);
-          if (!verification.ok) {
-            verificationFailed = verification;
-            break;
-          }
-        }
-      } catch (e6) {
-        console.warn(`[verify] shim errored for '${key}' (non-fatal): ${e6 instanceof Error ? e6.message : e6}`);
-      }
+    if (verification && !verification.ok) {
+      verificationFailed = verification;
+      break;
     }
     if (result.tags.needs_human_input === "true") {
       const question = result.tags.human_question;
@@ -75467,6 +75483,18 @@ function buildHandoffVerifier(opts) {
           }
         });
         check(wired, "variation-wired-in-code", `'${variation}' compared (quoted) alongside '${flagKey}'`, `'${variation}' never appears (quoted) in any file referencing '${flagKey}' \u2014 multivariate flag evaluated through a boolean helper? Every string variation is truthy, so the control path would be unreachable`);
+      }
+    }
+    if (t.metric_keys && opts.writer) {
+      for (const metricKey of t.metric_keys.split(",").filter(Boolean)) {
+        try {
+          check(await opts.writer.metricExists(metricKey), "metric-exists-in-ld", `metric '${metricKey}' exists in project '${opts.writer.projectKey}'`, `metric '${metricKey}' does NOT exist in project '${opts.writer.projectKey}' despite metric_keys`);
+        } catch (e6) {
+          failures.push({
+            name: "metric-exists-in-ld",
+            detail: `could not verify metric '${metricKey}' in LaunchDarkly: ${e6 instanceof Error ? e6.message : String(e6)}`
+          });
+        }
       }
     }
     if (t.metric_event_keys) {
@@ -76574,6 +76602,17 @@ var LdResourceWriter = class {
   /** Idempotent: turn on client-side ID availability for an existing flag. */
   async ensureClientSideAvailability(flagKey) {
     await this.ld.patchFlagProjectSemantic(flagKey, [{ kind: "turnOnClientSideAvailability", value: "usingEnvironmentId" }], "AutoFactory: expose frontend-scoped flag to client-side SDK");
+  }
+  /**
+   * Whether a metric exists in the app project — a direct lookup, so it holds in
+   * projects with more metrics than one listing page. Throws on anything other
+   * than found / not-found (an unreadable answer is not a "no").
+   */
+  async metricExists(metricKey) {
+    if (!metricKey)
+      throw new Error("metric key is required");
+    const res = await this.ld.getMetric(metricKey);
+    return res.status !== 404;
   }
   /**
    * Compact listing of the app project's existing metrics — lets the metrics
@@ -80248,25 +80287,40 @@ function samplingRateOf(j6) {
   const raw = typeof j6.samplingRate === "number" ? j6.samplingRate : 1;
   return raw > 1 ? raw / 100 : raw;
 }
+function formatVerificationEvidence(verification) {
+  if (!verification || verification.passed.length + verification.failures.length === 0)
+    return void 0;
+  return [
+    "DETERMINISTIC CHECKS (re-derived by the pipeline from the LaunchDarkly API and the checkout):",
+    ...verification.passed.map((c6) => `\u2713 ${c6.name}: ${c6.detail}`),
+    ...verification.failures.map((c6) => `\u2717 ${c6.name}: ${c6.detail}`)
+  ].join("\n");
+}
 function createJudgeHook(opts) {
-  return async ({ configKey, cfg, input, output, tracker }) => {
+  return async ({ configKey, cfg, input, output, tracker, verification }) => {
     const attachments = cfg.judgeConfiguration?.judges ?? [];
     const results = [];
     if (attachments.length === 0)
       return results;
     let judgeInput = input;
+    const sections = [];
     if (opts.evidence) {
       try {
         const evidence = await opts.evidence(configKey);
-        if (evidence) {
-          judgeInput = `${input}
-
---- VERIFIED EVIDENCE (gathered by the pipeline, NOT claimed by the agent) ---
-${evidence}`;
-        }
+        if (evidence)
+          sections.push(evidence);
       } catch (e6) {
         console.warn(`[judge] ${configKey}: evidence gathering failed (non-fatal): ${e6 instanceof Error ? e6.message : e6}`);
       }
+    }
+    const checks = formatVerificationEvidence(verification);
+    if (checks)
+      sections.push(checks);
+    if (sections.length > 0) {
+      judgeInput = `${input}
+
+--- VERIFIED EVIDENCE (gathered by the pipeline, NOT claimed by the agent) ---
+${sections.join("\n\n")}`;
     }
     for (const attachment of attachments) {
       const judgeKey = judgeKeyOf(attachment);
