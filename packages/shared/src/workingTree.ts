@@ -136,6 +136,8 @@ export interface WorkingTreeContext extends Record<string, unknown> {
   PR_BODY?: string;
   PR_BRANCH?: string;
   SHA?: string;
+  /** Tells every agent (via the prompt header) that edits stay uncommitted by design. */
+  DELIVERY_MODE?: "working-tree";
 }
 
 export async function buildWorkingTreeContext(root: string, state: RepoState): Promise<WorkingTreeContext> {
@@ -149,6 +151,7 @@ export async function buildWorkingTreeContext(root: string, state: RepoState): P
     PR_TITLE: subject ?? branch ?? "Local changes",
     PR_BODY: body ?? "",
     SHA: state.head,
+    DELIVERY_MODE: "working-tree",
   };
 }
 

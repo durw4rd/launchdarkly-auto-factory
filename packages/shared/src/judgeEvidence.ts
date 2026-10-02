@@ -18,6 +18,7 @@
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { WORKING_TREE_DELIVERY } from "./deliveryMode.js";
 
 /** Cap the evidence payload so judge prompts stay bounded. */
 const MAX_EVIDENCE_CHARS = 24_000;
@@ -157,7 +158,7 @@ export function createWorkingTreeEvidence(cwd: string): JudgeEvidenceCollector {
       if (parts.length === 0) {
         return "The agent made NO changes during this step (no working-tree edits, no commits).";
       }
-      return truncate(parts.join("\n\n"));
+      return truncate(`${WORKING_TREE_DELIVERY}\n\n${parts.join("\n\n")}`);
     } catch (e) {
       console.warn(`[judge] evidence collection failed for '${nodeKey}' (non-fatal): ${e instanceof Error ? e.message : e}`);
       return undefined;
