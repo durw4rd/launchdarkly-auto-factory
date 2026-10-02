@@ -44,6 +44,13 @@ untrusted code with your keys.
 | Approval gate (`auto-factory-approval-gates` flag) | Note lists the gated steps; status `pending`; job "passed with warnings" (exit 78) | Add the MR label `af-approve:<step>`, then **Run pipeline** on the MR's Pipelines tab — label changes alone don't start a pipeline |
 | Agent question (M14) | Note quotes the question; status `pending`; exit 78 | Set `humanInput.answer` in `.release-flags/pr-<iid>.json` on the MR branch and push — the push starts the pipeline |
 
+## Re-running on the same commit
+
+GitLab won't create a second MR pipeline for a commit that already has one, so
+force-pushing a branch back to an earlier commit starts nothing. Use **Run
+pipeline** on the MR's Pipelines tab, or the API:
+`POST /projects/:id/merge_requests/:iid/pipelines`.
+
 ## Not yet on GitLab
 
 Issue intake (`autofactory intake`), cross-repo research (`relatedRepos`),
