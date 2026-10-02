@@ -38,6 +38,7 @@
 
 import type { AgentGraphDefinition, AgentGraphNode, LDGraphTracker, LDTokenUsage } from "@launchdarkly/server-sdk-ai";
 import type { AgentNodeResult, AgentRunner } from "./agentRunner.js";
+import { WORKING_TREE_DELIVERY } from "./deliveryMode.js";
 import type { HandoffVerification, HandoffVerifier } from "./handoffVerifier.js";
 import type { JudgeHook } from "./judges.js";
 import { startHandoffSpan } from "./observability.js";
@@ -839,6 +840,7 @@ function buildPrompt(
     ctx.ISSUE_NUMBER ? `Issue: #${ctx.ISSUE_NUMBER}` : ctx.PR_NUMBER ? `Pull request: #${ctx.PR_NUMBER}` : "",
     ctx.ISSUE_NUMBER && ctx.PR_BRANCH ? `Working branch: ${ctx.PR_BRANCH}` : "",
     ctx.PR_TITLE ? `Title: ${ctx.PR_TITLE}` : "",
+    ctx.DELIVERY_MODE === "working-tree" ? WORKING_TREE_DELIVERY : "",
   ]
     .filter(Boolean)
     .join("\n");

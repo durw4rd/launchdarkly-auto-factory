@@ -13,7 +13,7 @@ import type {
   AgentNodeResult,
   AgentRunner,
 } from "@auto-factory/shared";
-import { describeLoopExhausted, walkGraph } from "@auto-factory/shared";
+import { WORKING_TREE_DELIVERY, describeLoopExhausted, walkGraph } from "@auto-factory/shared";
 
 /**
  * Fake runner: returns a scripted `{status, tags}` per config key (no network,
@@ -1128,6 +1128,23 @@ describe("walkGraph — resume (event-log replay)", () => {
     // Delivered once: the next live node must not inherit it.
     const testPrompt = (runner.promptsByKey.test ?? [])[0] ?? "";
     assert.doesNotMatch(testPrompt, /HUMAN GUIDANCE/);
+  });
+
+  it("working-tree delivery: every node's header says edits stay uncommitted by design; absent otherwise", async () => {
+    const script = { flag: { tags: { flag_ready: "true" } }, review: { tags: { review_approved: "true" } } };
+    const wt = new ScriptedRunner(script);
+    await walkGraph(graphFrom(reworkGraphValue(2)), wt, { PR_NUMBER: "1", DELIVERY_MODE: "working-tree" });
+    const nodes = Object.keys(wt.promptsByKey);
+    assert.ok(nodes.length > 1);
+    for (const k of nodes) {
+      for (const p of wt.promptsByKey[k] ?? []) assert.ok(p.includes(WORKING_TREE_DELIVERY), `${k} prompt carries the delivery note`);
+    }
+
+    const pushed = new ScriptedRunner(script);
+    await walkGraph(graphFrom(reworkGraphValue(2)), pushed, { PR_NUMBER: "1" });
+    for (const ps of Object.values(pushed.promptsByKey)) {
+      for (const p of ps) assert.ok(!p.includes("Delivery: working tree"), "push-mode prompts are unchanged");
+    }
   });
 
   it("6. DIVERGENCE: a journal naming a different node fails closed", async () => {

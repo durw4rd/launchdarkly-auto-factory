@@ -116,7 +116,8 @@ export async function runPhase1(opts: RunOptions): Promise<RunResult> {
   const policy = await resolveApprovalPolicy(ldClient, ldContext);
   const gate = createPolicyGate(policy, (node) => opts.confirmGate?.(node) ?? false);
 
-  const walk = await walkGraph(graphDef, runner, opts.context, {
+  // gitMode "workingTree": tell the agents their edits stay uncommitted by design.
+  const walk = await walkGraph(graphDef, runner, { ...opts.context, DELIVERY_MODE: "working-tree" }, {
     graphTracker,
     onEvent: (event) => {
       if (event.type === "node-start") reporter.nodeStart(event.configKey);
