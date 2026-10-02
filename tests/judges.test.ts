@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { type JudgeCompletion, type JudgeCompletionRequest, createJudgeHook, extractJsonObject } from "@auto-factory/shared";
+import {
+  type JudgeCompletion,
+  type JudgeCompletionRequest,
+  createJudgeHook,
+  extractJsonObject,
+  formatVerificationEvidence,
+} from "@auto-factory/shared";
 import type { LDAIAgentConfig, LDAIConfigTracker, LDAIJudgeConfig, LDJudgeResult } from "@launchdarkly/server-sdk-ai";
 
 /** Minimal judge AI config the SDK Judge class accepts. */
@@ -224,6 +230,66 @@ describe("judge evidence", () => {
     assert.match(requests[0]?.input ?? "", /Commits landed by this step: abc123/);
     // Evidence goes into the judge INPUT, never into the artifact being scored.
     assert.match(requests[0]?.input ?? "", /RESPONSE TO EVALUATE:\nthe report$/);
+  });
+
+  it("adds the deterministic checks to the evidence, alongside the diff", async () => {
+    const requests: JudgeCompletionRequest[] = [];
+    const hook = createJudgeHook({
+      aiClient: { judgeConfig: async () => stubJudgeConfig() } as never,
+      ldContext: { kind: "service", key: "test" },
+      completion: async (req) => {
+        requests.push(req);
+        return { parsed: { score: 0.9, reasoning: "verified" }, content: "{}", success: true };
+      },
+      evidence: async () => "Commits landed by this step: abc123 wire the flag",
+    });
+    const { tracker } = captureTracker();
+    await hook({
+      configKey: "autofactory-flag-implementer",
+      iteration: 1,
+      cfg: stubAgentConfig([{ key: "j", samplingRate: 1 }]),
+      input: "the brief",
+      output: "the report",
+      tracker,
+      verification: {
+        node: "autofactory-flag-implementer",
+        ok: false,
+        passed: [{ name: "flag-exists-in-ld", detail: "'enable-x' exists in project 'app'" }],
+        failures: [{ name: "variation-wired-in-code", detail: "'v1' never appears" }],
+      },
+    });
+    const input = requests[0]?.input ?? "";
+    assert.equal(input.match(/VERIFIED EVIDENCE/g)?.length, 1, "one evidence section, not two");
+    assert.match(input, /Commits landed by this step: abc123[\s\S]*DETERMINISTIC CHECKS/);
+    assert.match(input, /✓ flag-exists-in-ld: 'enable-x' exists in project 'app'/);
+    assert.match(input, /✗ variation-wired-in-code: 'v1' never appears/);
+    assert.match(input, /RESPONSE TO EVALUATE:\nthe report$/);
+  });
+
+  it("the checks alone still form an evidence section (no diff collector)", async () => {
+    const requests: JudgeCompletionRequest[] = [];
+    const hook = makeHook({ requests });
+    const { tracker } = captureTracker();
+    await hook({
+      configKey: "autofactory-metrics-author",
+      iteration: 1,
+      cfg: stubAgentConfig([{ key: "j", samplingRate: 1 }]),
+      input: "the brief",
+      output: "the report",
+      tracker,
+      verification: {
+        node: "autofactory-metrics-author",
+        ok: true,
+        passed: [{ name: "metric-exists-in-ld", detail: "metric 'm' exists in project 'app'" }],
+        failures: [],
+      },
+    });
+    assert.match(requests[0]?.input ?? "", /VERIFIED EVIDENCE[\s\S]*✓ metric-exists-in-ld/);
+  });
+
+  it("formatVerificationEvidence: nothing to add when no checks applied", () => {
+    assert.equal(formatVerificationEvidence(undefined), undefined);
+    assert.equal(formatVerificationEvidence({ node: "n", ok: true, passed: [], failures: [] }), undefined);
   });
 
   it("a failing evidence collector never blocks the evaluation", async () => {

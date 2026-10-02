@@ -264,6 +264,14 @@ export class LdClient {
     });
   }
 
+  /** GET one metric. Returns status 404 (not throwing) when it doesn't exist. */
+  getMetric<T = unknown>(metricKey: string): Promise<LdResponse<T>> {
+    return this.request<T>({
+      path: `/api/v2/metrics/${this.conn.projectKey}/${encodeURIComponent(metricKey)}`,
+      okStatuses: [404],
+    });
+  }
+
   /** List metrics in the project (paginated; caller filters). */
   listMetrics<T = unknown>(limit = 100): Promise<LdResponse<T>> {
     return this.request<T>({
