@@ -72413,6 +72413,9 @@ function extractConfigStamp(description) {
   return description?.match(STAMP_RE)?.[1];
 }
 
+// ../shared/dist/deliveryMode.js
+var WORKING_TREE_DELIVERY = "Delivery: working tree. This run leaves every edit uncommitted in the developer's checkout for them to review and commit; nothing is committed or pushed, by design. Uncommitted and untracked files are the expected deliverable, not a defect: assess the working tree as it stands.";
+
 // ../shared/dist/observability.js
 import * as nodeModule from "node:module";
 
@@ -74943,7 +74946,8 @@ function buildPrompt(isEntry, hasInbound, iteration, inventory, ctx, trigger, hu
     ctx.REPO ? `Repository: ${ctx.REPO}` : "",
     ctx.ISSUE_NUMBER ? `Issue: #${ctx.ISSUE_NUMBER}` : ctx.PR_NUMBER ? `Pull request: #${ctx.PR_NUMBER}` : "",
     ctx.ISSUE_NUMBER && ctx.PR_BRANCH ? `Working branch: ${ctx.PR_BRANCH}` : "",
-    ctx.PR_TITLE ? `Title: ${ctx.PR_TITLE}` : ""
+    ctx.PR_TITLE ? `Title: ${ctx.PR_TITLE}` : "",
+    ctx.DELIVERY_MODE === "working-tree" ? WORKING_TREE_DELIVERY : ""
   ].filter(Boolean).join("\n");
   const parts = [header];
   if (iteration > 1)
@@ -80346,7 +80350,9 @@ ${sections.join("\n\n")}`;
         if (result.sampled) {
           tracker.trackJudgeResult(result);
           const score = result.score !== void 0 ? result.score.toFixed(2) : "n/a";
-          console.log(`[judge] ${configKey} \u2190 '${judgeKey}' score=${score}` + (result.success ? "" : ` (eval FAILED: ${result.errorMessage ?? "unknown"})`) + (result.reasoning ? ` \u2014 ${result.reasoning.slice(0, 160)}` : ""));
+          console.log(`[judge] ${configKey} \u2190 '${judgeKey}' score=${score}` + (result.success ? "" : ` (eval FAILED: ${result.errorMessage ?? "unknown"})`) + // In full: a score is only actionable with its reason, and the
+          // reason is where a cap or a misread of the evidence shows up.
+          (result.reasoning ? ` \u2014 ${result.reasoning}` : ""));
         } else {
           console.log(`[judge] ${configKey}: judge '${judgeKey}' not sampled this run (rate ${rate})`);
         }

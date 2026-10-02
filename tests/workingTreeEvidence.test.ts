@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
 
-import { createWorkingTreeEvidence } from "@auto-factory/shared";
+import { WORKING_TREE_DELIVERY, createWorkingTreeEvidence } from "@auto-factory/shared";
 
 function git(cwd: string, args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
@@ -35,6 +35,16 @@ describe("createWorkingTreeEvidence", () => {
     const collect = createWorkingTreeEvidence(repo);
     const evidence = await collect("autofactory-flag-implementer");
     assert.match(evidence ?? "", /NO changes during this step/);
+  });
+
+  it("leads with the working-tree delivery note when there are changes", async () => {
+    const repo = makeRepo();
+    dirs.push(repo);
+    const collect = createWorkingTreeEvidence(repo);
+    writeFileSync(join(repo, "new-file.ts"), "export const y = 1;\n");
+    const evidence = (await collect("autofactory-flag-implementer")) ?? "";
+    assert.ok(evidence.startsWith(WORKING_TREE_DELIVERY), "the judge is told uncommitted is by design");
+    assert.match(evidence, /new file: new-file\.ts/);
   });
 
   it("captures commits landed mid-run (agents that bypass workingTree mode)", async () => {

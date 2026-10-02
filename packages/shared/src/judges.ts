@@ -261,7 +261,9 @@ export function createJudgeHook(opts: CreateJudgeHookOptions): JudgeHook {
           console.log(
             `[judge] ${configKey} ← '${judgeKey}' score=${score}` +
               (result.success ? "" : ` (eval FAILED: ${result.errorMessage ?? "unknown"})`) +
-              (result.reasoning ? ` — ${result.reasoning.slice(0, 160)}` : ""),
+              // In full: a score is only actionable with its reason, and the
+              // reason is where a cap or a misread of the evidence shows up.
+              (result.reasoning ? ` — ${result.reasoning}` : ""),
           );
         } else {
           console.log(`[judge] ${configKey}: judge '${judgeKey}' not sampled this run (rate ${rate})`);
