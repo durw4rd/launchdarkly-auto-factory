@@ -107,6 +107,44 @@ describe("handoff shims — flag claims", () => {
 });
 
 describe("handoff shims — metric + test claims", () => {
+  /** Writer stub that answers metricExists from `existing` (or throws). */
+  const metricWriter = (existing: string[], error?: string): LdResourceWriter =>
+    ({
+      projectKey: "app",
+      async metricExists(key: string) {
+        if (error) throw new Error(error);
+        return existing.includes(key);
+      },
+    }) as unknown as LdResourceWriter;
+
+  it("verifies every claimed metric exists in LD; a missing one fails", async () => {
+    const verify = buildHandoffVerifier({ sandboxRoot: root, writer: metricWriter(["m-error", "m-latency"]) });
+    const ok = await verify({ configKey: "metrics", tags: { metric_keys: "m-error,m-latency" } });
+    assert.equal(ok?.ok, true);
+    assert.deepEqual(ok?.passed.map((c) => c.detail), [
+      "metric 'm-error' exists in project 'app'",
+      "metric 'm-latency' exists in project 'app'",
+    ]);
+
+    const bad = await verify({ configKey: "metrics", tags: { metric_keys: "m-error,m-gone" } });
+    assert.equal(bad?.ok, false);
+    assert.equal(bad?.failures[0]?.name, "metric-exists-in-ld");
+    assert.match(bad?.failures[0]?.detail ?? "", /'m-gone' does NOT exist/);
+  });
+
+  it("an unreadable metric lookup is a failure, not a pass", async () => {
+    const verify = buildHandoffVerifier({ sandboxRoot: root, writer: metricWriter([], "HTTP 500") });
+    const r = await verify({ configKey: "metrics", tags: { metric_keys: "m-error" } });
+    assert.equal(r?.ok, false);
+    assert.match(r?.failures[0]?.detail ?? "", /could not verify metric 'm-error'.*HTTP 500/);
+  });
+
+  it("without a writer the metric existence check is skipped", async () => {
+    const verify = buildHandoffVerifier({ sandboxRoot: root });
+    const r = await verify({ configKey: "metrics", tags: { metric_keys: "m-error" } });
+    assert.ok(!r || ![...r.passed, ...r.failures].some((c) => c.name === "metric-exists-in-ld"));
+  });
+
   it("passes when every event-backed metric has an emitter; fails when one has none", async () => {
     write("src/api.ts", `flags.track('enable-x-error');\nflags.track('enable-x-latency', ms);\n`);
     const verify = buildHandoffVerifier({ sandboxRoot: root });

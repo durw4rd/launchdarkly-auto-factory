@@ -1305,6 +1305,50 @@ export async function walkGraph(
     runs.push(run);
     onEvent?.({ type: "node-complete", configKey: key, index: runs.length - 1, run });
 
+    // Deterministic handoff shim: re-derive this node's claims from primary
+    // evidence. A FAILED check halts the walk — downstream agents must not
+    // build on an unverified claim. (A shim implementation bug — an unexpected
+    // throw — logs and does not halt; evidential failures are reported inside
+    // the verification, not thrown.)
+    // Skipped on replay: a verification failure is not resumable, so every node in
+    // an accepted journal already passed. Re-running the shims against a checkout
+    // that may have moved is what the caller's invalidation keys are for.
+    //
+    // SKIPPED ON A FAILED RUN, mirroring the judge below, and for a sharper reason
+    // than symmetry. The shims re-derive the claims a HANDOFF makes; a failed run makes no handoff
+    // — the walk is about to stop — and its tags are whatever its tool calls managed to set before
+    // the error. Every shim trigger is a tool-set tag, so this was reachable and not exotically:
+    // `tests_last_run: "fail"` fails UNCONDITIONALLY (an agent whose run_tests went red and then
+    // timed out mid-fix hits it every time), `metric_event_keys` fails when `create_metric` landed
+    // but the `track()` call did not, and `flag_ready`/`flag_key` fail when `create_flag` landed but
+    // no code was wrapped yet. In each case the walk stops either way — but it stopped reporting
+    // `verificationFailed`, which accuses the agent of an unverified claim, instead of the honest
+    // outcome, which is that the run errored. Same dead end, wrong diagnosis, and the operator is
+    // sent to inspect claims rather than infrastructure.
+    //
+    // `stopped` and `cancelled` still verify, deliberately: those runs EXECUTED (a turn cap, an
+    // external abort) rather than errored, so their claims are real claims and partial work handed
+    // on unverified is exactly what the shims exist to catch.
+    //
+    // Runs BEFORE the judges so its results reach them as evidence: the claims a
+    // git diff can't show (the flag, its variation, the metrics exist in
+    // LaunchDarkly) are exactly the ones these checks re-read. The halt on a
+    // failed check waits until after the judges, so a failing run still records
+    // its quality score.
+    let verification: HandoffVerification | null = null;
+    if (verifier && !replaying && result.status !== "failed") {
+      try {
+        verification = await verifier({ configKey: key, tags: result.tags });
+        if (verification) {
+          onEvent?.({ type: "node-verified", verification });
+          for (const c of verification.passed) console.log(`[verify] ${key} ✓ ${c.name}: ${c.detail}`);
+          for (const c of verification.failures) console.error(`[verify] ${key} ✗ ${c.name}: ${c.detail}`);
+        }
+      } catch (e) {
+        console.warn(`[verify] shim errored for '${key}' (non-fatal): ${e instanceof Error ? e.message : e}`);
+      }
+    }
+
     // Judges attached to this node's config (if any) score the output now, on
     // the same tracker. Defensive: a judge problem must never break the walk.
     // Skipped on replay: the scores were recorded by the original walk (and served
@@ -1327,7 +1371,15 @@ export async function walkGraph(
     } else if (judgeHook && tracker) {
       let judgeResults: Awaited<ReturnType<JudgeHook>> = [];
       try {
-        judgeResults = await judgeHook({ configKey: key, iteration, cfg, input: prompt, output, tracker });
+        judgeResults = await judgeHook({
+          configKey: key,
+          iteration,
+          cfg,
+          input: prompt,
+          output,
+          tracker,
+          ...(verification ? { verification } : {}),
+        });
       } catch (e) {
         console.warn(`[judge] hook failed for '${key}' (non-fatal): ${e instanceof Error ? e.message : e}`);
       }
@@ -1352,45 +1404,10 @@ export async function walkGraph(
       }
     }
 
-    // Deterministic handoff shim: re-derive this node's claims from primary
-    // evidence. A FAILED check halts the walk — downstream agents must not
-    // build on an unverified claim. (A shim implementation bug — an unexpected
-    // throw — logs and does not halt; evidential failures are reported inside
-    // the verification, not thrown.)
-    // Skipped on replay: a verification failure is not resumable, so every node in
-    // an accepted journal already passed. Re-running the shims against a checkout
-    // that may have moved is what the caller's invalidation keys are for.
-    //
-    // SKIPPED ON A FAILED RUN, mirroring the judge sixteen lines above, and for a sharper reason
-    // than symmetry. The shims re-derive the claims a HANDOFF makes; a failed run makes no handoff
-    // — the walk is about to stop — and its tags are whatever its tool calls managed to set before
-    // the error. Every shim trigger is a tool-set tag, so this was reachable and not exotically:
-    // `tests_last_run: "fail"` fails UNCONDITIONALLY (an agent whose run_tests went red and then
-    // timed out mid-fix hits it every time), `metric_event_keys` fails when `create_metric` landed
-    // but the `track()` call did not, and `flag_ready`/`flag_key` fail when `create_flag` landed but
-    // no code was wrapped yet. In each case the walk stops either way — but it stopped reporting
-    // `verificationFailed`, which accuses the agent of an unverified claim, instead of the honest
-    // outcome, which is that the run errored. Same dead end, wrong diagnosis, and the operator is
-    // sent to inspect claims rather than infrastructure.
-    //
-    // `stopped` and `cancelled` still verify, deliberately: those runs EXECUTED (a turn cap, an
-    // external abort) rather than errored, so their claims are real claims and partial work handed
-    // on unverified is exactly what the shims exist to catch.
-    if (verifier && !replaying && result.status !== "failed") {
-      try {
-        const verification = await verifier({ configKey: key, tags: result.tags });
-        if (verification) {
-          onEvent?.({ type: "node-verified", verification });
-          for (const c of verification.passed) console.log(`[verify] ${key} ✓ ${c.name}: ${c.detail}`);
-          for (const c of verification.failures) console.error(`[verify] ${key} ✗ ${c.name}: ${c.detail}`);
-          if (!verification.ok) {
-            verificationFailed = verification;
-            break;
-          }
-        }
-      } catch (e) {
-        console.warn(`[verify] shim errored for '${key}' (non-fatal): ${e instanceof Error ? e.message : e}`);
-      }
+    // The deterministic-check halt (the checks themselves ran before the judges).
+    if (verification && !verification.ok) {
+      verificationFailed = verification;
+      break;
     }
 
     // Agent-initiated pause (metrics author rule M14): the node hit a question

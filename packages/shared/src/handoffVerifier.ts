@@ -17,6 +17,8 @@
  *  - `flag_ready` + `flag_key`  → the flag (and claimed variation) exists in
  *    LaunchDarkly, the key is referenced in the code, and a vN variation is
  *    referenced (quoted) in a file that evaluates the flag.
+ *  - `metric_keys`              → every metric the node claims exists in
+ *    LaunchDarkly (a direct lookup per key).
  *  - `metric_event_keys`        → every event-backed metric's event key has an
  *    emitter (`track(...)` call) in the code — except Sentry integration event
  *    keys (ADR 0014), which are fed by Sentry→LD, not track().
@@ -168,6 +170,27 @@ export function buildHandoffVerifier(opts: HandoffVerifierOptions): HandoffVerif
           `'${variation}' compared (quoted) alongside '${flagKey}'`,
           `'${variation}' never appears (quoted) in any file referencing '${flagKey}' — multivariate flag evaluated through a boolean helper? Every string variation is truthy, so the control path would be unreachable`,
         );
+      }
+    }
+
+    // ---- Metric existence claims (metrics-author handoff) ------------------
+    // metric_keys is tool-set on create_metric success, but a claim the judges
+    // can't see in a git diff — re-read it here so it reaches them as evidence.
+    if (t.metric_keys && opts.writer) {
+      for (const metricKey of t.metric_keys.split(",").filter(Boolean)) {
+        try {
+          check(
+            await opts.writer.metricExists(metricKey),
+            "metric-exists-in-ld",
+            `metric '${metricKey}' exists in project '${opts.writer.projectKey}'`,
+            `metric '${metricKey}' does NOT exist in project '${opts.writer.projectKey}' despite metric_keys`,
+          );
+        } catch (e) {
+          failures.push({
+            name: "metric-exists-in-ld",
+            detail: `could not verify metric '${metricKey}' in LaunchDarkly: ${e instanceof Error ? e.message : String(e)}`,
+          });
+        }
       }
     }
 
