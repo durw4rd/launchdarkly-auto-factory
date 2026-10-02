@@ -48,12 +48,12 @@ autofactory:
     # MR pipelines check out a detached refs/merge-requests/<iid>/head; the agents
     # need the real source branch (to push to) and the target branch (to diff).
     - git checkout -B "$CI_MERGE_REQUEST_SOURCE_BRANCH_NAME" "$CI_COMMIT_SHA"
-    - git fetch origin "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
+    - git fetch origin "+refs/heads/${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}:refs/remotes/origin/${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}"
     - git remote set-url origin "https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
     # The tool itself: the pre-built, self-contained Action bundle. Kept out of
     # the agents' commits via .git/info/exclude.
     - git clone --depth 1 --branch "$AUTOFACTORY_REF" "$AUTOFACTORY_REPO" .autofactory-tool
-    - echo ".autofactory-tool/" >> .git/info/exclude
+    - mkdir -p .git/info && echo ".autofactory-tool/" >> .git/info/exclude
     # Optional: knowledge-graph wrap points.
     - >-
       curl -fsSL https://github.com/launchdarkly/ld-find-code-refs/releases/download/v2.14.0/ld-find-code-refs_2.14.0_linux_amd64.tar.gz
