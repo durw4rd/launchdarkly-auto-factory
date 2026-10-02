@@ -71947,6 +71947,8 @@ var BETA = { "LD-API-Version": "beta" };
 var RATE_LIMIT_RETRIES = 6;
 var MIN_BACKOFF_MS = 500;
 var MAX_BACKOFF_MS = 15e3;
+var SERVER_ERROR_RETRIES = 2;
+var LOGGED_BODY_CHARS = 2e3;
 var sleep = (ms) => new Promise((r6) => setTimeout(r6, ms));
 function backoffMs(res) {
   const retryAfter = Number(res.headers.get("retry-after"));
@@ -71959,6 +71961,17 @@ function backoffMs(res) {
   }
   return 2e3;
 }
+function serverErrorBackoffMs(res, attempt) {
+  const retryAfter = Number(res.headers.get("retry-after"));
+  if (Number.isFinite(retryAfter) && retryAfter > 0) {
+    return Math.min(retryAfter * 1e3, MAX_BACKOFF_MS);
+  }
+  return 1e3 * 2 ** attempt;
+}
+function isRetryableOnServerError(opts) {
+  const method = (opts.method ?? "GET").toUpperCase();
+  return method === "GET" || method === "POST" && (opts.okStatuses?.includes(409) ?? false);
+}
 var LdClient = class {
   conn;
   constructor(conn) {
@@ -71969,6 +71982,7 @@ var LdClient = class {
   }
   async request(opts) {
     let res;
+    let serverErrors = 0;
     for (let attempt = 0; ; attempt++) {
       res = await fetch(`${this.conn.baseUrl}${opts.path}`, {
         method: opts.method ?? "GET",
@@ -71980,9 +71994,16 @@ var LdClient = class {
         },
         body: opts.body !== void 0 ? JSON.stringify(opts.body) : void 0
       });
-      if (res.status !== 429 || attempt >= RATE_LIMIT_RETRIES)
-        break;
-      await sleep(backoffMs(res));
+      if (res.status === 429 && attempt < RATE_LIMIT_RETRIES) {
+        await sleep(backoffMs(res));
+        continue;
+      }
+      if (res.status >= 500 && serverErrors < SERVER_ERROR_RETRIES && isRetryableOnServerError(opts)) {
+        await sleep(serverErrorBackoffMs(res, serverErrors));
+        serverErrors += 1;
+        continue;
+      }
+      break;
     }
     const text = await res.text();
     let data = text;
@@ -71994,7 +72015,12 @@ var LdClient = class {
     }
     const ok = res.ok || (opts.okStatuses?.includes(res.status) ?? false);
     if (!ok) {
-      throw new LdApiError(opts.method ?? "GET", opts.path, res.status, data);
+      const method = opts.method ?? "GET";
+      if (res.status >= 500) {
+        const sent = opts.body === void 0 ? "(none)" : JSON.stringify(opts.body).slice(0, LOGGED_BODY_CHARS);
+        console.warn(`[ld-api] ${method} ${opts.path} \u2192 HTTP ${res.status} after ${serverErrors + 1} attempt(s). Response: ${text.slice(0, LOGGED_BODY_CHARS) || "(empty)"} Request body: ${sent}`);
+      }
+      throw new LdApiError(method, opts.path, res.status, data, serverErrors + 1);
     }
     return { status: res.status, ok, data };
   }
@@ -72190,12 +72216,14 @@ var LdApiError = class extends Error {
   path;
   status;
   responseBody;
-  constructor(method, path6, status, responseBody) {
-    super(`LD API ${method} ${path6} failed: HTTP ${status} \u2014 ${JSON.stringify(responseBody)}`);
+  attempts;
+  constructor(method, path6, status, responseBody, attempts = 1) {
+    super(`LD API ${method} ${path6} failed: HTTP ${status}${attempts > 1 ? ` (after ${attempts} attempts)` : ""} \u2014 ${JSON.stringify(responseBody)}`);
     this.method = method;
     this.path = path6;
     this.status = status;
     this.responseBody = responseBody;
+    this.attempts = attempts;
     this.name = "LdApiError";
   }
 };

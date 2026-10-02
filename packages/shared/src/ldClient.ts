@@ -32,6 +32,15 @@ const RATE_LIMIT_RETRIES = 6;
 /** Bounds on how long a single 429 backoff may sleep (LD's reset is usually <10s). */
 const MIN_BACKOFF_MS = 500;
 const MAX_BACKOFF_MS = 15_000;
+/**
+ * Max automatic retries on HTTP 5xx, applied only where a repeat is harmless:
+ * GETs, and creates that treat 409 as success (a create that landed before the
+ * 5xx comes back as 409 on retry). PATCHes are never retried — a semantic
+ * patch could apply twice.
+ */
+const SERVER_ERROR_RETRIES = 2;
+/** Cap on the request body echoed into the log when a 5xx is surfaced. */
+const LOGGED_BODY_CHARS = 2000;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -51,6 +60,20 @@ function backoffMs(res: Response): number {
   return 2000;
 }
 
+/** Retry-After when the server sends one, else 1s, 2s, … */
+function serverErrorBackoffMs(res: Response, attempt: number): number {
+  const retryAfter = Number(res.headers.get("retry-after"));
+  if (Number.isFinite(retryAfter) && retryAfter > 0) {
+    return Math.min(retryAfter * 1000, MAX_BACKOFF_MS);
+  }
+  return 1000 * 2 ** attempt;
+}
+
+function isRetryableOnServerError(opts: LdRequestOptions): boolean {
+  const method = (opts.method ?? "GET").toUpperCase();
+  return method === "GET" || (method === "POST" && (opts.okStatuses?.includes(409) ?? false));
+}
+
 export class LdClient {
   constructor(private readonly conn: LdConnection) {}
 
@@ -60,6 +83,7 @@ export class LdClient {
 
   async request<T = unknown>(opts: LdRequestOptions): Promise<LdResponse<T>> {
     let res!: Response;
+    let serverErrors = 0;
     for (let attempt = 0; ; attempt++) {
       res = await fetch(`${this.conn.baseUrl}${opts.path}`, {
         method: opts.method ?? "GET",
@@ -71,8 +95,16 @@ export class LdClient {
         },
         body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
       });
-      if (res.status !== 429 || attempt >= RATE_LIMIT_RETRIES) break;
-      await sleep(backoffMs(res));
+      if (res.status === 429 && attempt < RATE_LIMIT_RETRIES) {
+        await sleep(backoffMs(res));
+        continue;
+      }
+      if (res.status >= 500 && serverErrors < SERVER_ERROR_RETRIES && isRetryableOnServerError(opts)) {
+        await sleep(serverErrorBackoffMs(res, serverErrors));
+        serverErrors += 1;
+        continue;
+      }
+      break;
     }
 
     const text = await res.text();
@@ -87,7 +119,17 @@ export class LdClient {
 
     const ok = res.ok || (opts.okStatuses?.includes(res.status) ?? false);
     if (!ok) {
-      throw new LdApiError(opts.method ?? "GET", opts.path, res.status, data);
+      const method = opts.method ?? "GET";
+      if (res.status >= 500) {
+        // A 5xx says nothing about which part of the request upset the server;
+        // keep the request on record so the next look isn't guesswork.
+        const sent = opts.body === undefined ? "(none)" : JSON.stringify(opts.body).slice(0, LOGGED_BODY_CHARS);
+        console.warn(
+          `[ld-api] ${method} ${opts.path} → HTTP ${res.status} after ${serverErrors + 1} attempt(s). ` +
+            `Response: ${text.slice(0, LOGGED_BODY_CHARS) || "(empty)"} Request body: ${sent}`,
+        );
+      }
+      throw new LdApiError(method, opts.path, res.status, data, serverErrors + 1);
     }
     return { status: res.status, ok, data: data as T };
   }
@@ -325,8 +367,12 @@ export class LdApiError extends Error {
     readonly path: string,
     readonly status: number,
     readonly responseBody: unknown,
+    /** Attempts made, including 5xx retries (1 = no retry). */
+    readonly attempts = 1,
   ) {
-    super(`LD API ${method} ${path} failed: HTTP ${status} — ${JSON.stringify(responseBody)}`);
+    super(
+      `LD API ${method} ${path} failed: HTTP ${status}${attempts > 1 ? ` (after ${attempts} attempts)` : ""} — ${JSON.stringify(responseBody)}`,
+    );
     this.name = "LdApiError";
   }
 }
