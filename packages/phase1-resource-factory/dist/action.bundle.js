@@ -81321,7 +81321,6 @@ function createGitHubHost(target) {
 var PAUSE_EXIT_CODE = 78;
 var MAX_DESCRIPTION = 255;
 var STATE = {
-  action_required: "pending",
   success: "success",
   failure: "failed",
   neutral: "skipped"
@@ -81382,6 +81381,10 @@ ${body}` })
       }
     },
     async postStatus(opts) {
+      if (opts.conclusion === "action_required") {
+        console.log(`(commit status '${opts.name ?? CHECK_NAME}' not posted \u2014 a pause on GitLab is the job's allowed-failure exit, not a status)`);
+        return;
+      }
       if (!project || !token || !opts.sha) {
         console.log("(commit status skipped \u2014 missing AUTOFACTORY_GITLAB_TOKEN / project / SHA)");
         return;
@@ -81395,7 +81398,10 @@ ${body}` })
             state: STATE[opts.conclusion],
             name,
             description: truncate3(opts.title, MAX_DESCRIPTION),
-            ...process.env.CI_JOB_URL ? { target_url: process.env.CI_JOB_URL } : {}
+            ...process.env.CI_JOB_URL ? { target_url: process.env.CI_JOB_URL } : {},
+            // Pinned only on the pipeline's own commit: the final verdict lands on the
+            // post-chain HEAD (the agents' commits), which has no pipeline of ours.
+            ...process.env.CI_PIPELINE_ID && opts.sha === process.env.CI_COMMIT_SHA ? { pipeline_id: Number(process.env.CI_PIPELINE_ID) } : {}
           })
         });
         console.log(

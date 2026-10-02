@@ -41,8 +41,8 @@ untrusted code with your keys.
 
 | Pause | What you see | To continue |
 |---|---|---|
-| Approval gate (`auto-factory-approval-gates` flag) | Note lists the gated steps; status `pending`; job "passed with warnings" (exit 78) | Add the MR label `af-approve:<step>`, then **Run pipeline** on the MR's Pipelines tab — label changes alone don't start a pipeline |
-| Agent question (M14) | Note quotes the question; status `pending`; exit 78 | Set `humanInput.answer` in `.release-flags/pr-<iid>.json` on the MR branch and push — the push starts the pipeline |
+| Approval gate (`auto-factory-approval-gates` flag) | Note lists the gated steps; job "passed with warnings" (exit 78) | Add the MR label `af-approve:<step>`, then **Run pipeline** on the MR's Pipelines tab — label changes alone don't start a pipeline |
+| Agent question (M14) | Note quotes the question; job "passed with warnings" (exit 78) | Set `humanInput.answer` in `.release-flags/pr-<iid>.json` on the MR branch and push — the push starts the pipeline |
 
 ## Re-running on the same commit
 

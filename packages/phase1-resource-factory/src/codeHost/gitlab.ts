@@ -12,8 +12,15 @@ import type { CodeHost, StatusConclusion } from "./types.js";
  * reads that the job token covers (MR description) still go through.
  *
  * Semantics that differ from GitHub:
- * - No `action_required`: a pause posts a `pending` status, and the job exits
- *   PAUSE_EXIT_CODE, which the CI template lists under `allow_failure: exit_codes`.
+ * - No `action_required`, and no status can stand in for it: a `pending` commit
+ *   status becomes a job in the pipeline it lands in, and nothing ever completes
+ *   it — the paused pipeline shows "running" forever (seen live). So a pause posts
+ *   no status at all: the job exits PAUSE_EXIT_CODE, which the CI template lists
+ *   under `allow_failure: exit_codes` (yellow, "passed with warnings"), and the MR
+ *   note says what to do.
+ * - A status on this pipeline's own commit attaches to THIS pipeline
+ *   (CI_PIPELINE_ID). Unpinned, GitLab picks the newest pipeline for the SHA,
+ *   which can be a different run's.
  * - Label changes don't start pipelines: approving is "add the label, then run a
  *   new pipeline". Labels are read from CI_MERGE_REQUEST_LABELS (set when the
  *   pipeline was created), so a re-run picks up labels added since.
@@ -24,8 +31,7 @@ export const PAUSE_EXIT_CODE = 78;
 /** GitLab commit-status descriptions are capped at 255 characters. */
 const MAX_DESCRIPTION = 255;
 
-const STATE: Record<StatusConclusion, string> = {
-  action_required: "pending",
+const STATE: Record<Exclude<StatusConclusion, "action_required">, string> = {
   success: "success",
   failure: "failed",
   neutral: "skipped",
@@ -105,6 +111,10 @@ export function createGitLabHost(target: GitLabTarget = gitLabTargetFromEnv()): 
     },
 
     async postStatus(opts) {
+      if (opts.conclusion === "action_required") {
+        console.log(`(commit status '${opts.name ?? CHECK_NAME}' not posted — a pause on GitLab is the job's allowed-failure exit, not a status)`);
+        return;
+      }
       if (!project || !token || !opts.sha) {
         console.log("(commit status skipped — missing AUTOFACTORY_GITLAB_TOKEN / project / SHA)");
         return;
@@ -119,6 +129,11 @@ export function createGitLabHost(target: GitLabTarget = gitLabTargetFromEnv()): 
             name,
             description: truncate(opts.title, MAX_DESCRIPTION),
             ...(process.env.CI_JOB_URL ? { target_url: process.env.CI_JOB_URL } : {}),
+            // Pinned only on the pipeline's own commit: the final verdict lands on the
+            // post-chain HEAD (the agents' commits), which has no pipeline of ours.
+            ...(process.env.CI_PIPELINE_ID && opts.sha === process.env.CI_COMMIT_SHA
+              ? { pipeline_id: Number(process.env.CI_PIPELINE_ID) }
+              : {}),
           }),
         });
         console.log(

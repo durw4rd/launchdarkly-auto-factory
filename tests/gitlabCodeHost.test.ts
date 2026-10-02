@@ -44,6 +44,7 @@ const ENV_KEYS = [
   "AUTOFACTORY_CODE_HOST",
   "CI_MERGE_REQUEST_LABELS",
   "CI_JOB_URL",
+  "CI_PIPELINE_ID",
   "CI_PROJECT_PATH",
   "CI_COMMIT_SHA",
   "CI_MERGE_REQUEST_IID",
@@ -97,21 +98,27 @@ describe("GitLab code host: MR note", () => {
 });
 
 describe("GitLab code host: commit status", () => {
-  it("maps action_required → pending and truncates the description to 255", async () => {
-    process.env.CI_JOB_URL = "https://gitlab.example/job/1";
+  it("a pause posts NO status (a pending one would leave the pipeline running forever)", async () => {
     stubFetch();
-    await createGitLabHost(target).postStatus({
-      sha: "abc",
-      conclusion: "action_required",
-      title: "x".repeat(300),
-      summary: "s",
-    });
-    const body = calls[0]?.body as Record<string, string>;
+    await createGitLabHost(target).postStatus({ sha: "abc", conclusion: "action_required", title: "t", summary: "s" });
+    assert.equal(calls.length, 0);
+  });
+
+  it("truncates the description to 255, links the job, and pins only the pipeline's own commit", async () => {
+    Object.assign(process.env, { CI_JOB_URL: "https://gitlab.example/job/1", CI_PIPELINE_ID: "42", CI_COMMIT_SHA: "abc" });
+    stubFetch();
+    const host = createGitLabHost(target);
+    await host.postStatus({ sha: "abc", conclusion: "success", title: "x".repeat(300), summary: "s" });
+    const body = calls[0]?.body as Record<string, unknown>;
     assert.equal(calls[0]?.url, "https://gitlab.example/api/v4/projects/grp%2Fsub%2Fapp/statuses/abc");
-    assert.equal(body.state, "pending");
     assert.equal(body.name, "AutoFactory — Approval gate");
-    assert.equal(body.description?.length, 255);
+    assert.equal((body.description as string).length, 255);
     assert.equal(body.target_url, "https://gitlab.example/job/1");
+    assert.equal(body.pipeline_id, 42);
+
+    // The post-chain HEAD (the agents' commits) isn't this pipeline's commit: not pinned.
+    await host.postStatus({ sha: "def", conclusion: "success", title: "t", summary: "s" });
+    assert.equal((calls[1]?.body as Record<string, unknown>).pipeline_id, undefined);
   });
 
   it("maps success / failure and keeps an explicit name", async () => {

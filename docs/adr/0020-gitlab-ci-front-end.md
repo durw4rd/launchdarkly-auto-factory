@@ -33,7 +33,10 @@ GitLab differs where it matters:
    picks GitLab when `GITLAB_CI=true` (or `AUTOFACTORY_CODE_HOST=gitlab`).
 2. **GitLab implementation over REST v4.** The single summary note is found by
    the same hidden marker and updated in place. Statuses use the same names as
-   the GitHub check runs, with `action_required` mapped to `pending`. Writes
+   the GitHub check runs. `action_required` posts nothing: a `pending` status
+   becomes a job in its pipeline that nothing completes, so the paused pipeline
+   showed "running" forever on the first live gate test. A status on the
+   pipeline's own commit is pinned to it (`pipeline_id`). Writes
    need `AUTOFACTORY_GITLAB_TOKEN` (`api` scope); reads the job token covers
    (the full MR description, which `CI_MERGE_REQUEST_DESCRIPTION` truncates at
    2700 characters) fall back to it.
