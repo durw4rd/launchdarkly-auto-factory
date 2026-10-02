@@ -15,7 +15,7 @@
  * the consuming workflow is missing `permissions: checks: write`).
  */
 
-const CHECK_NAME = "AutoFactory — Approval gate";
+export const CHECK_NAME = "AutoFactory — Approval gate";
 
 export interface CheckRunTarget {
   repo?: string; // owner/name

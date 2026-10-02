@@ -44,6 +44,18 @@ export function assemblePrContext(): PrContext {
     }
   }
 
+  // GitLab MR pipelines: the same fields from GitLab's predefined variables
+  // (only set in merge_request_event pipelines). CI_MERGE_REQUEST_DESCRIPTION is
+  // truncated at 2700 chars; action.ts swaps in the full text when it can.
+  if (process.env.GITLAB_CI === "true") {
+    ctx.REPO ??= process.env.CI_PROJECT_PATH;
+    ctx.SHA ??= process.env.CI_COMMIT_SHA;
+    ctx.HEAD_SHA ??= process.env.CI_COMMIT_SHA;
+    ctx.PR_NUMBER ??= process.env.CI_MERGE_REQUEST_IID;
+    ctx.PR_TITLE ??= process.env.CI_MERGE_REQUEST_TITLE;
+    ctx.PR_BODY ??= process.env.CI_MERGE_REQUEST_DESCRIPTION;
+  }
+
   // Explicit input overrides (action.yml inputs are exposed as INPUT_* / env).
   ctx.PR_NUMBER = process.env.PR_NUMBER ?? ctx.PR_NUMBER;
   ctx.PR_TITLE = process.env.PR_TITLE ?? ctx.PR_TITLE;

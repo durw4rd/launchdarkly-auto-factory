@@ -65,9 +65,8 @@ import {
   withProvider,
   withRunAttributes,
 } from "@auto-factory/shared";
-import { postCheckRun } from "./checkRun.js";
-import { postPrComment } from "./comment.js";
-import { approveLabel, ensureLabel, fetchApprovalActor, fetchApprovedSteps } from "./labels.js";
+import { type CodeHost, fetchMrDescription, isGitLab, resolveCodeHost } from "./codeHost/index.js";
+import { approveLabel } from "./labels.js";
 import { type PrContext, assemblePrContext } from "./prContext.js";
 
 /**
@@ -241,6 +240,7 @@ function checkoutHeadSha(root: string): string | undefined {
  * Best-effort: never fails the run.
  */
 async function reviewManifestIntent(opts: {
+  host: CodeHost;
   sandboxRoot: string;
   prNumber?: string;
   repo?: string;
@@ -257,7 +257,7 @@ async function reviewManifestIntent(opts: {
 
     // approvedBy: auto-filled from whoever added the af-approve:* label.
     if (opts.gatesCleared && !intent.approvedBy) {
-      const actor = await fetchApprovalActor(opts.repo, opts.prNumber, process.env.GITHUB_TOKEN);
+      const actor = await opts.host.approvalActor();
       const rawIntent = (manifest.releaseIntent ?? {}) as Record<string, unknown>;
       if (actor && !rawIntent.approvedBy) {
         rawIntent.approvedBy = actor;
@@ -356,7 +356,13 @@ function inputStatusLine(node: string, reworked: boolean, inventory: Record<stri
   return `\`${node}\` paused the chain on a question it could not answer from the repo. Nothing was created for this or later steps.`;
 }
 
-function buildGateComment(gatedSteps: string[], approved: Set<string>, pendingNode: string, statusLine: string): string {
+function buildGateComment(
+  gatedSteps: string[],
+  approved: Set<string>,
+  pendingNode: string,
+  statusLine: string,
+  host: CodeHost,
+): string {
   const lines = gatedSteps.map((step) => {
     if (approved.has(step)) return `- ✓ \`${step}\` — approved`;
     if (step === pendingNode) return `- ⏸ \`${step}\` — **awaiting approval**: add the label \`${approveLabel(step)}\``;
@@ -366,7 +372,9 @@ function buildGateComment(gatedSteps: string[], approved: Set<string>, pendingNo
     "### LaunchDarkly Auto-Factory — Phase 1 ⏸ awaiting approval",
     "",
     statusLine,
-    "Approve by adding the labeled step below; the chain resumes on the next run.",
+    host.name === "github"
+      ? "Approve by adding the labeled step below; the chain resumes on the next run."
+      : "Approve by adding the labeled step below, then start a new pipeline (MR → Pipelines → Run pipeline) — label changes alone don't trigger one.",
     "",
     ...lines,
   ].join("\n");
@@ -467,6 +475,8 @@ async function detectConfigDrift(graphKey: string): Promise<string | undefined> 
 async function main(): Promise<void> {
   mapActionInputs();
   const context = assemblePrContext();
+  if (isGitLab() && !process.env.PR_BODY) context.PR_BODY = (await fetchMrDescription()) ?? context.PR_BODY;
+  const host = resolveCodeHost({ repo: context.REPO, prNumber: context.PR_NUMBER });
 
   // Sentry AI agent monitoring for factory runners (ADR 0014). No-op without DSN.
   await initFactorySentry({ serviceName: "auto-factory-phase1-gha" });
@@ -574,7 +584,7 @@ async function main(): Promise<void> {
   const policy = await resolveApprovalPolicy(ldClient, ldContext);
   let approvedSteps = new Set<string>();
   if (policy.mode !== "yolo") {
-    approvedSteps = await fetchApprovedSteps(context.REPO, context.PR_NUMBER, process.env.GITHUB_TOKEN);
+    approvedSteps = await host.approvedSteps();
   }
   const gate = createPolicyGate(policy, (node) => approvedSteps.has(node));
   const stepsDesc = policy.steps.map((s) => s.step + (s.threshold !== undefined ? `@${s.threshold}` : "")).join(", ");
@@ -692,24 +702,25 @@ async function main(): Promise<void> {
   if (walk.pendingApproval) {
     const node = walk.pendingApproval.node;
     const label = approveLabel(node);
-    await ensureLabel(context.REPO, label, process.env.GITHUB_TOKEN);
-    console.log(`::warning::AutoFactory: awaiting approval before '${node}'. Add the PR label '${label}' to proceed.`);
+    await host.ensureApprovalLabel(label);
+    console.log(`::warning::AutoFactory: awaiting approval before '${node}'. Add the ${host.changeNoun} label '${label}' to proceed.`);
     // One status sentence, reused by the PR comment and the check-run summary so
     // they can't diverge; "prior iteration" wording only when a loop re-ran a node.
     const reworked = walk.runs.some((r) => r.iteration > 1);
     const statusLine = gateStatusLine(node, reworked, walk.inventory);
-    const summary = buildGateComment(policy.steps.map((s) => s.step), approvedSteps, node, statusLine);
-    await postPrComment(summary, { prNumber: context.PR_NUMBER, repo: context.REPO });
+    const summary = buildGateComment(policy.steps.map((s) => s.step), approvedSteps, node, statusLine, host);
+    await host.postComment(summary);
     // Carry the pause as a distinct `action_required` check run rather than a red
     // failure, so it doesn't read as a pipeline error or a reviewer rejection
-    // (which also exit 1). The job itself exits 0 — the check run is the signal.
-    await postCheckRun({
-      repo: context.REPO,
-      headSha: context.HEAD_SHA,
+    // (which also exit 1). On GitHub the job exits 0 — the check run is the
+    // signal; GitLab has no such state, so it exits the host's pause code.
+    await host.postStatus({
+      sha: context.HEAD_SHA,
       conclusion: "action_required",
       title: `Approval required before ${node}`,
-      summary: `${statusLine} Add the PR label \`${label}\` to approve; the chain resumes on the next run.`,
+      summary: `${statusLine} ${host.approveHint(label)}`,
     });
+    process.exitCode = host.pauseExitCode;
     return;
   }
 
@@ -723,7 +734,7 @@ async function main(): Promise<void> {
     const { node, question } = walk.pendingInput;
     const manifestPath = context.PR_NUMBER ? `.release-flags/pr-${context.PR_NUMBER}.json` : ".release-flags/<pr>.json";
     console.log(`::warning::AutoFactory: '${node}' paused with a question for a human${question ? `: ${question}` : ""}.`);
-    await postPrComment(
+    await host.postComment(
       [
         `## ⏸ AutoFactory needs a human answer`,
         "",
@@ -732,24 +743,22 @@ async function main(): Promise<void> {
         ...(question ? [`> ${question}`, ""] : []),
         `**To answer:** edit \`${manifestPath}\` on this branch and set \`"humanInput": {"answer": "..."}\` (the agent's full analysis is in the run log). Pushing the edit re-runs the chain, which reads your answer and continues.`,
       ].join("\n"),
-      { prNumber: context.PR_NUMBER, repo: context.REPO },
     );
-    await postCheckRun({
-      repo: context.REPO,
-      headSha: context.HEAD_SHA,
+    await host.postStatus({
+      sha: context.HEAD_SHA,
       conclusion: "action_required",
       title: `Human answer needed by ${node}`,
       summary: `The chain paused on a question from \`${node}\`${question ? `: ${question}` : ""}. Answer in \`${manifestPath}\` → \`humanInput.answer\` and push; the chain resumes on the next run.`,
     });
+    process.exitCode = host.pauseExitCode;
     return;
   }
 
   // Gates were active and all cleared: post a `success` check under the same
   // name so it supersedes any earlier `action_required` on this head SHA.
   if (gate) {
-    await postCheckRun({
-      repo: context.REPO,
-      headSha: context.HEAD_SHA,
+    await host.postStatus({
+      sha: context.HEAD_SHA,
       conclusion: "success",
       title: "Approval gates satisfied",
       summary: `Approved step(s): ${[...approvedSteps].join(", ") || "(none gated this run)"}. The chain proceeded past all gates.`,
@@ -758,6 +767,7 @@ async function main(): Promise<void> {
 
   // Release intent: validate + surface on the PR; stamp approvedBy on gate clear.
   const intentReview = await reviewManifestIntent({
+    host,
     sandboxRoot,
     ...(context.PR_NUMBER ? { prNumber: context.PR_NUMBER } : {}),
     ...(context.REPO ? { repo: context.REPO } : {}),
@@ -822,15 +832,14 @@ async function main(): Promise<void> {
   ]
     .filter(Boolean)
     .join("\n");
-  await postPrComment(summary, { prNumber: context.PR_NUMBER, repo: context.REPO });
+  await host.postComment(summary);
 
   // Always post the verdict as a named check run, attached to the POST-chain
   // HEAD: the agents' [skip ci] commits move the PR head past the workflow's own
   // check, so without this the PR's latest commit shows no AutoFactory status.
-  await postCheckRun({
+  await host.postStatus({
     name: "AutoFactory — Phase 1",
-    repo: context.REPO,
-    headSha: checkoutHeadSha(sandboxRoot) ?? context.HEAD_SHA,
+    sha: checkoutHeadSha(sandboxRoot) ?? context.HEAD_SHA,
     conclusion: !walk.verificationFailed && !walk.loopExhausted && (decision.apply || decision.noop) ? "success" : "failure",
     title: walk.verificationFailed
       ? `Deterministic check failed after ${walk.verificationFailed.node}`
