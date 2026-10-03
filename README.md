@@ -17,10 +17,11 @@ end-to-end against a live demo repo. Not a product.
   (`.release-flags/…json`) records the flag, metrics, and rollout parameters. LaunchDarkly
   **judges** attached to the coding agents score each output 0..1 against the agent's actual
   git diff — a sampled, non-blocking evaluation layer (the reviewer remains the gate; see
-  [ADR 0007](docs/adr/0007-judges-for-coding-agents.md)). Phase 1 has four
+  [ADR 0007](docs/adr/0007-judges-for-coding-agents.md)). Phase 1 has several
   interchangeable front ends over one shared core (see [Phase 1 front ends](#phase-1-front-ends)):
-  a **GitHub Action**, a **Cursor/VS Code extension**, a **native Cursor automation**,
-  and a **headless CLI** driven from a terminal or a Claude Code session.
+  a **GitHub Action**, **GitLab CI/CD**, a **Cursor/VS Code extension**, a **native Cursor
+  automation**, a **headless CLI** driven from a terminal or a Claude Code / Codex session, and
+  the **GitHub Copilot cloud agent**.
 - **Phase 2 (after deploy):** Beacon, a small HTTP service, receives deploy webhooks,
   diffs `.release-flags/` between the deployed SHA and the previous one, and starts a
   guarded release for each new manifest (turning the flag on atomically). It then monitors
@@ -46,10 +47,11 @@ Design history: [docs/adr/](docs/adr/).
 | Path | What it is |
 |------|------------|
 | `packages/shared/` | LD clients (REST + native SDK), the `AgentRunner` provider seam, the Anthropic / Vega / Cursor runners and agent tools, LLM-observability spans (LD + Sentry AI monitoring), the release adapter, and the provider-agnostic Phase 1 orchestration (graph walk + approval) |
-| `packages/phase1-resource-factory/` | Phase 1 front end #1 (GitHub Action): code; its drop-in workflow lives in `bootstrap/github-action-template/` |
+| `packages/phase1-resource-factory/` | Phase 1 front end #1 (GitHub Action): code; its drop-in workflow lives in `bootstrap/github-action-template/`. The same bundle also runs in GitLab CI (front end #7) through the code-host seam in `src/codeHost/` |
 | `packages/phase1-cursor-extension/` | Phase 1 front end #2 (Cursor/VS Code extension): working-tree edits from the editor, calls Anthropic directly |
 | `bootstrap/cursor-automation/` | Phase 1 front end #3 (native Cursor automation): a drop-in `.cursor/` rule + command + MCP config; runs in Cursor's own agent (local prototype) |
 | `packages/phase1-cli/` | Phase 1 front end #4 (headless `autofactory` CLI): the full chain against a local working tree; the drop-in Claude Code and Codex skills that drive it live in `bootstrap/claude-code/` and `bootstrap/codex/` |
+| `bootstrap/gitlab-ci-template/` | Phase 1 front end #7 (GitLab CI/CD): a drop-in `.gitlab-ci.yml` that runs the Action bundle on merge-request pipelines, plus setup notes (ADR 0020) |
 | `bootstrap/copilot/` | Phase 1 front end #6 (GitHub Copilot cloud agent): a drop-in `.github/agents/` custom agent + `copilot-setup-steps.yml` that run the `autofactory` CLI inside Copilot's cloud sandbox |
 | `packages/beacon/` | Phase 2 release orchestrator (webhooks, discovery, trigger, monitor, optional Seer Autofix on revert) |
 | `packages/config-bridge/` | CLI that provisions/syncs the agent configs, graph, operational flags, and shared APP metrics between LD projects |
@@ -63,20 +65,21 @@ Design history: [docs/adr/](docs/adr/).
 
 ## Phase 1 front ends
 
-The same six-agent chain (one shared core in `packages/shared`) runs from six entry points;
+The same six-agent chain (one shared core in `packages/shared`) runs from seven entry points;
 pick whichever fits where you work. All of them create the same flag/metrics/tests and write the
 same release manifest — they differ only in trigger, output, and which models run the agents.
 
 | Front end | Trigger | Output | Models | Status |
 |-----------|---------|--------|--------|--------|
 | **GitHub Action** — [`packages/phase1-resource-factory`](packages/phase1-resource-factory/), template in [`bootstrap/github-action-template/`](bootstrap/github-action-template/) | a pull request, in CI | commits to the PR branch | Anthropic / Bedrock / Vega / Cursor / OpenAI (flag-selected; bootstrap default is a 50/50 anthropic/cursor split per run, ADR 0018; model per agent from the AI config) | primary, verified path (Bedrock path not yet exercised live) |
+| **GitLab CI/CD** — ([`src/codeHost/`](packages/phase1-resource-factory/src/codeHost/)), template in [`bootstrap/gitlab-ci-template/`](bootstrap/gitlab-ci-template/) | a merge request pipeline, in GitLab CI | commits to the MR branch (job-token push), one sticky MR note, commit statuses | Anthropic (ADR 0018: `gitlab` surface → Anthropic; Bedrock/OpenAI via the provider flag; no Cursor, as the drop-in runs the bundle without `npm ci`) | new; verified live on gitlab.com (full chain, approval pause + resume). Approvals resume by label + **Run pipeline** (label changes don't start pipelines); intake, cross-repo research, and Beacon are GitHub-only for now (ADR 0020) |
 | **Cursor/VS Code extension** — [`packages/phase1-cursor-extension`](packages/phase1-cursor-extension/) | a button or a new commit, in the editor | edits left in your working tree | Anthropic API or Bedrock (Cursor can't expose its models to extensions) | working |
 | **Native Cursor automation** — [`bootstrap/cursor-automation`](bootstrap/cursor-automation/) | the `/autofactory` command in Cursor | edits left in your working tree | Cursor's own models (no API key) | local prototype; cloud (auto, PR-based) is a later phase |
 | **Headless CLI / Claude Code / Codex** — [`packages/phase1-cli`](packages/phase1-cli/), skills in [`bootstrap/claude-code/`](bootstrap/claude-code/) and [`bootstrap/codex/`](bootstrap/codex/) | `autofactory run` in a terminal, `/autofactory` in Claude Code, or `$autofactory` in Codex | edits left in your working tree | Anthropic, Bedrock, or OpenAI — routed per surface (ADR 0018: Claude Code → Anthropic, Codex → OpenAI; the working-tree ceiling requires a sandboxed runner — see the CLI README) | new; full fidelity (judges, monitoring, gates) |
 | **GitHub Copilot cloud agent** — [`bootstrap/copilot/`](bootstrap/copilot/) | a Copilot cloud-agent session using the `autofactory` custom agent (agents panel, issue assignment, or `@copilot` on a PR) | commits to the session's PR branch | Anthropic (ADR 0018: `copilot` surface → Anthropic; the cloud sandbox needs a sandbox-confined runner) | infra validated live; in-session chain blocked by harness behavior — pair with the GitHub Action as the chain runner (see the bootstrap README) |
 
-Setup for the GitHub Action is below; the extension, the automation, and the CLI each have their
-own README. For the Claude Code, Codex, and Copilot paths there are standalone install guides:
+Setup for the GitHub Action is below; GitLab CI/CD, the extension, the automation, and the CLI each
+have their own README (GitLab: [`bootstrap/gitlab-ci-template/README.md`](bootstrap/gitlab-ci-template/README.md)). For the Claude Code, Codex, and Copilot paths there are standalone install guides:
 [INSTALL-CLAUDE-CODE.md](INSTALL-CLAUDE-CODE.md), [INSTALL-CODEX.md](INSTALL-CODEX.md), and
 [INSTALL-COPILOT.md](INSTALL-COPILOT.md).
 Locally-driven runs (CLI / Claude Code / Codex) set the developer as the created flag's
