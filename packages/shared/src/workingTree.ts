@@ -66,10 +66,14 @@ async function resolveBase(cwd: string, base: string): Promise<string | undefine
   return undefined;
 }
 
-function parseSlug(remoteUrl: string): string | undefined {
+export function parseSlug(remoteUrl: string): string | undefined {
   // git@github.com:owner/name.git  |  https://github.com/owner/name(.git)
-  const m = remoteUrl.match(/[:/]([^/:]+\/[^/]+?)(?:\.git)?\s*$/);
-  return m?.[1];
+  // GitLab nests groups, so keep the whole path: git@gitlab.com:group/sub/name.git
+  const url = remoteUrl.trim();
+  const m =
+    url.match(/^[a-z][a-z0-9+.-]*:\/\/[^/]+\/(.+?)(?:\.git)?\/?$/i) ?? // https://host/path, ssh://git@host/path
+    url.match(/^[^/\s]+@[^:/\s]+:(.+?)(?:\.git)?\/?$/); // scp-like git@host:path
+  return m?.[1]?.includes("/") ? m[1] : undefined;
 }
 
 export async function readRepoState(cwd: string, base: string): Promise<RepoState> {

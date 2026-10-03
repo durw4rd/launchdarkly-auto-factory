@@ -1,0 +1,65 @@
+# Drop this into your GitLab project as .gitlab-ci.yml (or `include:` it from yours).
+#
+# AutoFactory Phase 1 on GitLab merge requests — the GitLab counterpart of
+# bootstrap/github-action-template/auto-factory.yml. On every MR pipeline it runs
+# the agent chain over the MR's source branch: creates the flag (targeting off) in
+# the app project, wires it in, instruments metrics, adds tests, writes the release
+# manifest, commits to the MR branch, and reports back as one MR note plus an
+# `AutoFactory — Phase 1` commit status. Setup: see README.md next to this file.
+#
+# Differences from the GitHub Action, by design:
+# - Pauses (approval gate, agent question) exit 78, listed under allow_failure, so
+#   the job shows "passed with warnings" — GitLab has no `action_required`.
+# - Label changes don't start pipelines: to pass an approval gate, add the
+#   `af-approve:<step>` label, then run a new pipeline from the MR's Pipelines tab.
+# - The agents push with CI_JOB_TOKEN, and job-token pushes start no pipeline,
+#   so the bot's commits can't loop. They deliberately do NOT carry [skip ci]:
+#   on GitLab that marker on the head commit also skips MANUAL pipelines, which
+#   would block the "Run pipeline" that resumes past an approval gate.
+
+workflow:
+  rules:
+    # No author-based loop guard: the head is often the bot's own commit (the
+    # manifest lands before an approval gate), and "skip bot-authored heads"
+    # would skip the human's Run pipeline that resumes past the gate. Loops are
+    # already impossible: job-token pushes start no pipeline.
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+autofactory:
+  image: node:24
+  interruptible: true
+  timeout: 90m
+  # 78 = paused for a human (approval or question): yellow, not red.
+  allow_failure:
+    exit_codes: [78]
+  variables:
+    GIT_DEPTH: "0"                 # agents diff the branch against its base
+    AUTOFACTORY_REPO: https://github.com/launchdarkly-labs/launchdarkly-auto-factory.git
+    AUTOFACTORY_REF: main          # branch or tag; pin a tag for reproducible runs
+    AUTOFACTORY_SURFACE: gitlab    # provider-flag targeting (ADR 0018)
+    GRAPH_KEY: gha-auto-factory
+    ENABLE_FLAG_CREATION: "true"   # create real flags/metrics in the app project
+    ENABLE_CODE_CHANGES: "true"    # commit wiring + tests to the MR branch
+    SANDBOX_ROOT: "."
+    PR_BRANCH: $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME
+    PR_BASE_REF: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME
+    # Set as CI/CD variables (Settings → CI/CD → Variables), masked, NOT protected
+    # (protected variables aren't passed to MR pipelines from unprotected branches):
+    #   LD_SDK_KEY, LD_API_KEY, ANTHROPIC_API_KEY, AUTOFACTORY_GITLAB_TOKEN,
+    #   LD_APP_PROJECT_KEY (plain), TYPESAFE_API_KEY (optional, Jev).
+  before_script:
+    # MR pipelines check out a detached refs/merge-requests/<iid>/head; the agents
+    # need the real source branch (to push to) and the target branch (to diff).
+    - git checkout -B "$CI_MERGE_REQUEST_SOURCE_BRANCH_NAME" "$CI_COMMIT_SHA"
+    - git fetch origin "+refs/heads/${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}:refs/remotes/origin/${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}"
+    - git remote set-url origin "https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
+    # The tool itself: the pre-built, self-contained Action bundle. Kept out of
+    # the agents' commits via .git/info/exclude.
+    - git clone --depth 1 --branch "$AUTOFACTORY_REF" "$AUTOFACTORY_REPO" .autofactory-tool
+    - mkdir -p .git/info && echo ".autofactory-tool/" >> .git/info/exclude
+    # Optional: knowledge-graph wrap points.
+    - >-
+      curl -fsSL https://github.com/launchdarkly/ld-find-code-refs/releases/download/v2.14.0/ld-find-code-refs_2.14.0_linux_amd64.tar.gz
+      | tar -xz -C /usr/local/bin ld-find-code-refs || echo "ld-find-code-refs unavailable (optional)"
+  script:
+    - node .autofactory-tool/packages/phase1-resource-factory/dist/action.bundle.js

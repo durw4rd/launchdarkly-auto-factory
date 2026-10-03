@@ -1433,7 +1433,11 @@ export class SandboxToolExecutor {
         this.runGit(["add", rel]);
         const staged = this.runGit(["diff", "--cached", "--name-only"]).trim();
         if (staged) {
-          this.runGit(["commit", "-m", `chore(auto-factory): ${existed ? "update" : "create"} ${rel}\n\n[skip ci]`]);
+          this.runGit([
+            "commit",
+            "-m",
+            `chore(auto-factory): ${existed ? "update" : "create"} ${rel}${this.skipCi ? "\n\n[skip ci]" : ""}`,
+          ]);
           const branch = this.prBranch ?? process.env.PR_BRANCH;
           this.runGit(branch ? ["push", "origin", `HEAD:${branch}`] : ["push"]);
           commitNote = "committed and pushed to the PR branch";

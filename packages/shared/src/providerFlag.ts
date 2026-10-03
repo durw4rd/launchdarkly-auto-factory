@@ -15,7 +15,8 @@ const DEFAULT_PROVIDER: AiProvider = "anthropic";
 
 // Surface-aware routing lives in this flag's targeting rules (clauses on the
 // run context's `surface` attribute — see pipelineContext): claude-code →
-// anthropic, codex → openai, github-action → 50/50 anthropic/cursor.
+// anthropic, codex → openai, gitlab → anthropic, github-action → 50/50
+// anthropic/cursor.
 const KNOWN_PROVIDERS: ReadonlySet<string> = new Set<AiProvider>(["anthropic", "bedrock", "vega", "cursor", "openai"]);
 
 export async function resolveAiProvider(

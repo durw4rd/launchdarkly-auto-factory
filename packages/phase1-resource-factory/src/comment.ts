@@ -8,7 +8,7 @@
  */
 
 /** Hidden marker used to find this action's prior comment on a PR. */
-const MARKER = "<!-- auto-factory-phase1 -->";
+export const MARKER = "<!-- auto-factory-phase1 -->";
 
 export interface CommentTarget {
   prNumber?: string;

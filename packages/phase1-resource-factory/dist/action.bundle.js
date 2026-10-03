@@ -77813,9 +77813,11 @@ ${verdicts.join("\n")}` : "")
         this.runGit(["add", rel]);
         const staged = this.runGit(["diff", "--cached", "--name-only"]).trim();
         if (staged) {
-          this.runGit(["commit", "-m", `chore(auto-factory): ${existed ? "update" : "create"} ${rel}
-
-[skip ci]`]);
+          this.runGit([
+            "commit",
+            "-m",
+            `chore(auto-factory): ${existed ? "update" : "create"} ${rel}${this.skipCi ? "\n\n[skip ci]" : ""}`
+          ]);
           const branch = this.prBranch ?? process.env.PR_BRANCH;
           this.runGit(branch ? ["push", "origin", `HEAD:${branch}`] : ["push"]);
           commitNote = "committed and pushed to the PR branch";
@@ -81352,6 +81354,190 @@ async function fetchApprovalActor(repo, prNumber, token) {
   }
 }
 
+// src/codeHost/github.ts
+function createGitHubHost(target) {
+  const token = () => process.env.GITHUB_TOKEN;
+  return {
+    name: "github",
+    changeNoun: "PR",
+    pauseExitCode: 0,
+    skipCiMarker: true,
+    postComment: (body) => postPrComment(body, { prNumber: target.prNumber, repo: target.repo }),
+    postStatus: (opts) => postCheckRun({
+      name: opts.name,
+      repo: target.repo,
+      headSha: opts.sha,
+      conclusion: opts.conclusion,
+      title: opts.title,
+      summary: opts.summary
+    }),
+    approvedSteps: () => fetchApprovedSteps(target.repo, target.prNumber, token()),
+    ensureApprovalLabel: (label) => ensureLabel(target.repo, label, token()),
+    approvalActor: () => fetchApprovalActor(target.repo, target.prNumber, token()),
+    approveHint: (label) => `Add the PR label \`${label}\` to approve; the chain resumes on the next run.`
+  };
+}
+
+// src/codeHost/gitlab.ts
+var PAUSE_EXIT_CODE = 78;
+var MAX_DESCRIPTION = 255;
+var STATE = {
+  success: "success",
+  failure: "failed",
+  neutral: "skipped"
+};
+function gitLabTargetFromEnv(env2 = process.env) {
+  return {
+    apiUrl: env2.CI_API_V4_URL,
+    projectId: env2.CI_PROJECT_ID,
+    mrIid: env2.CI_MERGE_REQUEST_IID,
+    token: env2.AUTOFACTORY_GITLAB_TOKEN,
+    jobToken: env2.CI_JOB_TOKEN
+  };
+}
+function truncate3(s2, max) {
+  return s2.length <= max ? s2 : `${s2.slice(0, max - 1)}\u2026`;
+}
+function createGitLabHost(target = gitLabTargetFromEnv()) {
+  const { apiUrl, projectId, mrIid, token } = target;
+  const project = projectId ? `${apiUrl}/projects/${encodeURIComponent(projectId)}` : void 0;
+  const mr = project && mrIid ? `${project}/merge_requests/${mrIid}` : void 0;
+  const headers = (t, isJobToken = false) => ({
+    [isJobToken ? "JOB-TOKEN" : "PRIVATE-TOKEN"]: t,
+    "Content-Type": "application/json"
+  });
+  async function findNote() {
+    if (!mr || !token) return void 0;
+    try {
+      const res = await fetch(`${mr}/notes?per_page=100&sort=desc`, { headers: headers(token) });
+      if (!res.ok) return void 0;
+      const notes = await res.json();
+      return notes.find((n3) => n3.body?.includes(MARKER))?.id;
+    } catch {
+      return void 0;
+    }
+  }
+  return {
+    name: "gitlab",
+    changeNoun: "MR",
+    pauseExitCode: PAUSE_EXIT_CODE,
+    skipCiMarker: false,
+    async postComment(body) {
+      if (!mr || !token) {
+        console.log("(MR note skipped \u2014 missing AUTOFACTORY_GITLAB_TOKEN / project / MR iid)");
+        return;
+      }
+      try {
+        const existing = await findNote();
+        const res = await fetch(existing ? `${mr}/notes/${existing}` : `${mr}/notes`, {
+          method: existing ? "PUT" : "POST",
+          headers: headers(token),
+          body: JSON.stringify({ body: `${MARKER}
+${body}` })
+        });
+        console.log(
+          res.ok ? existing ? "Updated MR summary note." : "Posted MR summary note." : `MR note failed: HTTP ${res.status}`
+        );
+      } catch (e6) {
+        console.warn(`MR note error (non-fatal): ${e6 instanceof Error ? e6.message : e6}`);
+      }
+    },
+    async postStatus(opts) {
+      if (opts.conclusion === "action_required") {
+        console.log(`(commit status '${opts.name ?? CHECK_NAME}' not posted \u2014 a pause on GitLab is the job's allowed-failure exit, not a status)`);
+        return;
+      }
+      if (!project || !token || !opts.sha) {
+        console.log("(commit status skipped \u2014 missing AUTOFACTORY_GITLAB_TOKEN / project / SHA)");
+        return;
+      }
+      const name = opts.name ?? CHECK_NAME;
+      try {
+        const res = await fetch(`${project}/statuses/${opts.sha}`, {
+          method: "POST",
+          headers: headers(token),
+          body: JSON.stringify({
+            state: STATE[opts.conclusion],
+            name,
+            description: truncate3(opts.title, MAX_DESCRIPTION),
+            ...process.env.CI_JOB_URL ? { target_url: process.env.CI_JOB_URL } : {},
+            // Pinned only on the pipeline's own commit: the final verdict lands on the
+            // post-chain HEAD (the agents' commits), which has no pipeline of ours.
+            ...process.env.CI_PIPELINE_ID && opts.sha === process.env.CI_COMMIT_SHA ? { pipeline_id: Number(process.env.CI_PIPELINE_ID) } : {}
+          })
+        });
+        console.log(
+          res.ok ? `Posted commit status '${name}' [${STATE[opts.conclusion]}].` : `Commit status failed: HTTP ${res.status}`
+        );
+      } catch (e6) {
+        console.warn(`Commit status error (non-fatal): ${e6 instanceof Error ? e6.message : e6}`);
+      }
+    },
+    async approvedSteps() {
+      const approved = /* @__PURE__ */ new Set();
+      for (const l4 of (process.env.CI_MERGE_REQUEST_LABELS ?? "").split(",")) {
+        const name = l4.trim();
+        if (name.startsWith(APPROVE_LABEL_PREFIX)) approved.add(name.slice(APPROVE_LABEL_PREFIX.length));
+      }
+      return approved;
+    },
+    async ensureApprovalLabel(label) {
+      if (!project || !token) return;
+      try {
+        await fetch(`${project}/labels`, {
+          method: "POST",
+          headers: headers(token),
+          body: JSON.stringify({
+            name: label,
+            color: "#0e8a16",
+            description: "AutoFactory: approve this gated step to proceed"
+          })
+        });
+      } catch {
+      }
+    },
+    async approvalActor() {
+      if (!mr || !token) return void 0;
+      try {
+        const res = await fetch(`${mr}/resource_label_events?per_page=100`, { headers: headers(token) });
+        if (!res.ok) return void 0;
+        const events = await res.json();
+        const added = events.filter(
+          (e6) => e6.action === "add" && e6.label?.name?.startsWith(APPROVE_LABEL_PREFIX) && e6.user?.username
+        );
+        return added.at(-1)?.user?.username;
+      } catch {
+        return void 0;
+      }
+    },
+    approveHint: (label) => `Add the MR label \`${label}\`, then start a new pipeline (MR \u2192 Pipelines \u2192 Run pipeline) \u2014 label changes alone don't trigger one.`
+  };
+}
+async function fetchMrDescription(target = gitLabTargetFromEnv()) {
+  const { apiUrl, projectId, mrIid } = target;
+  const auth = target.token ? { "PRIVATE-TOKEN": target.token } : target.jobToken ? { "JOB-TOKEN": target.jobToken } : void 0;
+  if (!apiUrl || !projectId || !mrIid || !auth) return void 0;
+  try {
+    const res = await fetch(`${apiUrl}/projects/${encodeURIComponent(projectId)}/merge_requests/${mrIid}`, {
+      headers: auth
+    });
+    if (!res.ok) return void 0;
+    return (await res.json()).description ?? void 0;
+  } catch {
+    return void 0;
+  }
+}
+
+// src/codeHost/index.ts
+function isGitLab(env2 = process.env) {
+  const forced = env2.AUTOFACTORY_CODE_HOST?.toLowerCase();
+  if (forced) return forced === "gitlab";
+  return env2.GITLAB_CI === "true";
+}
+function resolveCodeHost(target) {
+  return isGitLab() ? createGitLabHost() : createGitHubHost(target);
+}
+
 // src/prContext.ts
 import { existsSync as existsSync5, readFileSync as readFileSync7 } from "node:fs";
 function assemblePrContext() {
@@ -81372,6 +81558,14 @@ function assemblePrContext() {
       }
     } catch {
     }
+  }
+  if (process.env.GITLAB_CI === "true") {
+    ctx.REPO ??= process.env.CI_PROJECT_PATH;
+    ctx.SHA ??= process.env.CI_COMMIT_SHA;
+    ctx.HEAD_SHA ??= process.env.CI_COMMIT_SHA;
+    ctx.PR_NUMBER ??= process.env.CI_MERGE_REQUEST_IID;
+    ctx.PR_TITLE ??= process.env.CI_MERGE_REQUEST_TITLE;
+    ctx.PR_BODY ??= process.env.CI_MERGE_REQUEST_DESCRIPTION;
   }
   ctx.PR_NUMBER = process.env.PR_NUMBER ?? ctx.PR_NUMBER;
   ctx.PR_TITLE = process.env.PR_TITLE ?? ctx.PR_TITLE;
@@ -81400,7 +81594,7 @@ function createVegaClient() {
   console.log("VEGA_ENDPOINT/VEGA_TOKEN not set \u2014 using stub transport (no agent execution).");
   return new VegaClient(new StubVegaTransport());
 }
-function createAgentRunner(provider, kg) {
+function createAgentRunner(provider, kg, skipCi) {
   if (provider === "vega") {
     if (kg) console.log("Knowledge graph: composed, but the Vega provider runs tools server-side \u2014 enrichment applies to local providers only.");
     return new VegaAgentRunner(createVegaClient());
@@ -81420,6 +81614,7 @@ function createAgentRunner(provider, kg) {
   const localOpts = {
     sandboxRoot,
     codeChangesEnabled,
+    skipCi,
     ...writer ? { writer } : {},
     ...process.env.PR_BRANCH ? { prBranch: process.env.PR_BRANCH } : {},
     ...process.env.PR_BASE_REF ? { prBaseRef: process.env.PR_BASE_REF } : {},
@@ -81494,7 +81689,7 @@ async function reviewManifestIntent(opts) {
     const manifest = JSON.parse(readFileSync8(abs, "utf8"));
     const { intent, issues } = normalizeReleaseIntent(manifest.releaseIntent);
     if (opts.gatesCleared && !intent.approvedBy) {
-      const actor = await fetchApprovalActor(opts.repo, opts.prNumber, process.env.GITHUB_TOKEN);
+      const actor = await opts.host.approvalActor();
       const rawIntent = manifest.releaseIntent ?? {};
       if (actor && !rawIntent.approvedBy) {
         rawIntent.approvedBy = actor;
@@ -81506,9 +81701,8 @@ async function reviewManifestIntent(opts) {
           git2(["config", "user.name", "LaunchDarkly AutoFactory"]);
           git2(["add", rel]);
           if (git2(["diff", "--cached", "--name-only"]).trim()) {
-            git2(["commit", "-m", `chore(auto-factory): record approvedBy=${actor} in ${rel}
-
-[skip ci]`]);
+            const marker = opts.host.skipCiMarker ? "\n\n[skip ci]" : "";
+            git2(["commit", "-m", `chore(auto-factory): record approvedBy=${actor} in ${rel}${marker}`]);
             const branch = opts.prBranch ?? process.env.PR_BRANCH;
             git2(branch ? ["push", "origin", `HEAD:${branch}`] : ["push"]);
             console.log(`Release intent: recorded approvedBy=${actor} in ${rel}.`);
@@ -81559,7 +81753,7 @@ function inputStatusLine(node, reworked, inventory) {
   }
   return `\`${node}\` paused the chain on a question it could not answer from the repo. Nothing was created for this or later steps.`;
 }
-function buildGateComment(gatedSteps, approved, pendingNode, statusLine) {
+function buildGateComment(gatedSteps, approved, pendingNode, statusLine, host) {
   const lines = gatedSteps.map((step) => {
     if (approved.has(step)) return `- \u2713 \`${step}\` \u2014 approved`;
     if (step === pendingNode) return `- \u23F8 \`${step}\` \u2014 **awaiting approval**: add the label \`${approveLabel(step)}\``;
@@ -81569,7 +81763,7 @@ function buildGateComment(gatedSteps, approved, pendingNode, statusLine) {
     "### LaunchDarkly Auto-Factory \u2014 Phase 1 \u23F8 awaiting approval",
     "",
     statusLine,
-    "Approve by adding the labeled step below; the chain resumes on the next run.",
+    host.name === "github" ? "Approve by adding the labeled step below; the chain resumes on the next run." : "Approve by adding the labeled step below, then start a new pipeline (MR \u2192 Pipelines \u2192 Run pipeline) \u2014 label changes alone don't trigger one.",
     "",
     ...lines
   ].join("\n");
@@ -81645,6 +81839,8 @@ async function detectConfigDrift(graphKey) {
 async function main() {
   mapActionInputs();
   const context = assemblePrContext();
+  if (isGitLab() && !process.env.PR_BODY) context.PR_BODY = await fetchMrDescription() ?? context.PR_BODY;
+  const host = resolveCodeHost({ repo: context.REPO, prNumber: context.PR_NUMBER });
   await initFactorySentry({ serviceName: "auto-factory-phase1-gha" });
   const { ldClient, aiClient } = await getLdSdk();
   process.env.AUTOFACTORY_SURFACE ||= "github-action";
@@ -81710,11 +81906,11 @@ async function main() {
   } else {
     console.log("Knowledge graph: off (auto-factory-knowledge-graph) \u2014 agents run un-enriched (baseline).");
   }
-  const runner = createAgentRunner(provider, kg);
+  const runner = createAgentRunner(provider, kg, host.skipCiMarker);
   const policy = await resolveApprovalPolicy(ldClient, ldContext);
   let approvedSteps = /* @__PURE__ */ new Set();
   if (policy.mode !== "yolo") {
-    approvedSteps = await fetchApprovedSteps(context.REPO, context.PR_NUMBER, process.env.GITHUB_TOKEN);
+    approvedSteps = await host.approvedSteps();
   }
   const gate = createPolicyGate(policy, (node) => approvedSteps.has(node));
   const stepsDesc = policy.steps.map((s2) => s2.step + (s2.threshold !== void 0 ? `@${s2.threshold}` : "")).join(", ");
@@ -81779,26 +81975,26 @@ ${jevTable}`);
   if (walk2.pendingApproval) {
     const node = walk2.pendingApproval.node;
     const label = approveLabel(node);
-    await ensureLabel(context.REPO, label, process.env.GITHUB_TOKEN);
-    console.log(`::warning::AutoFactory: awaiting approval before '${node}'. Add the PR label '${label}' to proceed.`);
+    await host.ensureApprovalLabel(label);
+    console.log(`::warning::AutoFactory: awaiting approval before '${node}'. Add the ${host.changeNoun} label '${label}' to proceed.`);
     const reworked = walk2.runs.some((r6) => r6.iteration > 1);
     const statusLine = gateStatusLine(node, reworked, walk2.inventory);
-    const summary2 = buildGateComment(policy.steps.map((s2) => s2.step), approvedSteps, node, statusLine);
-    await postPrComment(summary2, { prNumber: context.PR_NUMBER, repo: context.REPO });
-    await postCheckRun({
-      repo: context.REPO,
-      headSha: context.HEAD_SHA,
+    const summary2 = buildGateComment(policy.steps.map((s2) => s2.step), approvedSteps, node, statusLine, host);
+    await host.postComment(summary2);
+    await host.postStatus({
+      sha: context.HEAD_SHA,
       conclusion: "action_required",
       title: `Approval required before ${node}`,
-      summary: `${statusLine} Add the PR label \`${label}\` to approve; the chain resumes on the next run.`
+      summary: `${statusLine} ${host.approveHint(label)}`
     });
+    process.exitCode = host.pauseExitCode;
     return;
   }
   if (walk2.pendingInput) {
     const { node, question } = walk2.pendingInput;
     const manifestPath = context.PR_NUMBER ? `.release-flags/pr-${context.PR_NUMBER}.json` : ".release-flags/<pr>.json";
     console.log(`::warning::AutoFactory: '${node}' paused with a question for a human${question ? `: ${question}` : ""}.`);
-    await postPrComment(
+    await host.postComment(
       [
         `## \u23F8 AutoFactory needs a human answer`,
         "",
@@ -81806,28 +82002,27 @@ ${jevTable}`);
         "",
         ...question ? [`> ${question}`, ""] : [],
         `**To answer:** edit \`${manifestPath}\` on this branch and set \`"humanInput": {"answer": "..."}\` (the agent's full analysis is in the run log). Pushing the edit re-runs the chain, which reads your answer and continues.`
-      ].join("\n"),
-      { prNumber: context.PR_NUMBER, repo: context.REPO }
+      ].join("\n")
     );
-    await postCheckRun({
-      repo: context.REPO,
-      headSha: context.HEAD_SHA,
+    await host.postStatus({
+      sha: context.HEAD_SHA,
       conclusion: "action_required",
       title: `Human answer needed by ${node}`,
       summary: `The chain paused on a question from \`${node}\`${question ? `: ${question}` : ""}. Answer in \`${manifestPath}\` \u2192 \`humanInput.answer\` and push; the chain resumes on the next run.`
     });
+    process.exitCode = host.pauseExitCode;
     return;
   }
   if (gate) {
-    await postCheckRun({
-      repo: context.REPO,
-      headSha: context.HEAD_SHA,
+    await host.postStatus({
+      sha: context.HEAD_SHA,
       conclusion: "success",
       title: "Approval gates satisfied",
       summary: `Approved step(s): ${[...approvedSteps].join(", ") || "(none gated this run)"}. The chain proceeded past all gates.`
     });
   }
   const intentReview = await reviewManifestIntent({
+    host,
     sandboxRoot,
     ...context.PR_NUMBER ? { prNumber: context.PR_NUMBER } : {},
     ...context.REPO ? { repo: context.REPO } : {},
@@ -81874,11 +82069,10 @@ ${jevTable}`);
     ...agentRows.length ? agentRows : ["| (none ran) | \u2014 | \u2014 | \u2014 |"],
     ...jevTable ? ["", "<details><summary>Jev pre-classification</summary>", "", jevTable, "", "</details>"] : []
   ].filter(Boolean).join("\n");
-  await postPrComment(summary, { prNumber: context.PR_NUMBER, repo: context.REPO });
-  await postCheckRun({
+  await host.postComment(summary);
+  await host.postStatus({
     name: "AutoFactory \u2014 Phase 1",
-    repo: context.REPO,
-    headSha: checkoutHeadSha(sandboxRoot) ?? context.HEAD_SHA,
+    sha: checkoutHeadSha(sandboxRoot) ?? context.HEAD_SHA,
     conclusion: !walk2.verificationFailed && !walk2.loopExhausted && (decision.apply || decision.noop) ? "success" : "failure",
     title: walk2.verificationFailed ? `Deterministic check failed after ${walk2.verificationFailed.node}` : walk2.loopExhausted ? `Loop did not converge at ${walk2.loopExhausted.node}` : decision.reason,
     summary
