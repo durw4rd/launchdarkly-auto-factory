@@ -287,6 +287,21 @@ describe("judge evidence", () => {
     assert.match(requests[0]?.input ?? "", /VERIFIED EVIDENCE[\s\S]*✓ metric-exists-in-ld/);
   });
 
+  it("formatVerificationEvidence: carried resources get their own labelled lines", () => {
+    const text = formatVerificationEvidence({
+      node: "metrics",
+      ok: true,
+      passed: [{ name: "tests-green-at-handoff", detail: "last run_tests execution passed" }],
+      failures: [],
+      carried: [
+        { name: "metric-exists-in-ld", ok: true, detail: "metric 'm1' exists in project 'app'" },
+        { name: "flag-exists-in-ld", ok: false, detail: "'enable-x' does NOT exist in project 'app'" },
+      ],
+    });
+    assert.match(text ?? "", /✓ tests-green-at-handoff[\s\S]*created earlier in this run[\s\S]*✓ metric-exists-in-ld: metric 'm1'[\s\S]*✗ flag-exists-in-ld/);
+    assert.ok(formatVerificationEvidence({ node: "n", ok: true, passed: [], failures: [], carried: [{ name: "x", ok: true, detail: "d" }] }));
+  });
+
   it("formatVerificationEvidence: nothing to add when no checks applied", () => {
     assert.equal(formatVerificationEvidence(undefined), undefined);
     assert.equal(formatVerificationEvidence({ node: "n", ok: true, passed: [], failures: [] }), undefined);
