@@ -294,6 +294,25 @@ export function buildHandoffVerifier(opts: HandoffVerifierOptions): HandoffVerif
       }
     }
 
+    // Event emitters an earlier pass instrumented, re-grepped in the checkout as it
+    // stands now (a no-op rework pass restates them). Evidence only, like the rest
+    // of `carried`: an emitter that's gone shows as ✗ to the judge, never as a
+    // node failure — the walker's rule against treating earlier event keys as
+    // live claims stands.
+    const ownEvents = new Set((t.metric_event_keys ?? "").split(",").filter(Boolean));
+    for (const eventKey of (inv.metric_event_keys ?? "").split(",").filter(Boolean)) {
+      if (ownEvents.has(eventKey) || SENTRY_INTEGRATION_EVENT_KEYS.has(eventKey)) continue;
+      const emitters = filesContaining(opts.sandboxRoot, eventKey);
+      carried.push({
+        name: "metric-event-instrumented",
+        ok: emitters.length > 0,
+        detail:
+          emitters.length > 0
+            ? `event '${eventKey}' emitted in ${emitters.slice(0, 2).join(", ")}`
+            : `event '${eventKey}' has no emitter in the code`,
+      });
+    }
+
     if (passed.length === 0 && failures.length === 0 && carried.length === 0) return null;
     return {
       node: run.configKey,

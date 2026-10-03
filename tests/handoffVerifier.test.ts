@@ -244,6 +244,31 @@ describe("handoff shims — resources carried from earlier passes", () => {
     assert.match(unreadable?.carried?.[0]?.detail ?? "", /could not re-read: HTTP 503/);
   });
 
+  it("re-greps event emitters an earlier pass instrumented; a missing one is evidence, not a failure", async () => {
+    write("src/api.ts", `flags.track('m-error');\n`);
+    const verify = buildHandoffVerifier({ sandboxRoot: root });
+    const r = await verify({
+      configKey: "metrics",
+      tags: { tests_last_run: "pass" },
+      inventory: { metric_event_keys: "m-error,m-gone,sentry-errors" },
+    });
+    assert.equal(r?.ok, true);
+    assert.deepEqual(r?.failures, []);
+    assert.deepEqual(
+      r?.carried?.map((c) => `${c.ok ? "✓" : "✗"} ${c.detail}`),
+      ["✓ event 'm-error' emitted in src/api.ts", "✗ event 'm-gone' has no emitter in the code"],
+      "Sentry integration keys need no emitter and are skipped",
+    );
+  });
+
+  it("an event this pass claims itself is its own check, not carried", async () => {
+    write("src/api.ts", `flags.track('m-error');\n`);
+    const verify = buildHandoffVerifier({ sandboxRoot: root });
+    const r = await verify({ configKey: "metrics", tags: { metric_event_keys: "m-error" }, inventory: { metric_event_keys: "m-error" } });
+    assert.equal(r?.passed.length, 1);
+    assert.equal(r?.carried, undefined);
+  });
+
   it("nothing carried and nothing claimed → null, as before", async () => {
     const verify = buildHandoffVerifier({ sandboxRoot: root, writer: writer({}, []) });
     assert.equal(await verify({ configKey: "research", tags: {}, inventory: {} }), null);

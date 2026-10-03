@@ -75560,6 +75560,17 @@ function buildHandoffVerifier(opts) {
         await carry("metric-exists-in-ld", () => writer.metricExists(metricKey), `metric '${metricKey}' exists in project '${writer.projectKey}'`, `metric '${metricKey}' does NOT exist in project '${writer.projectKey}'`);
       }
     }
+    const ownEvents = new Set((t.metric_event_keys ?? "").split(",").filter(Boolean));
+    for (const eventKey of (inv.metric_event_keys ?? "").split(",").filter(Boolean)) {
+      if (ownEvents.has(eventKey) || SENTRY_INTEGRATION_EVENT_KEYS.has(eventKey))
+        continue;
+      const emitters = filesContaining(opts.sandboxRoot, eventKey);
+      carried.push({
+        name: "metric-event-instrumented",
+        ok: emitters.length > 0,
+        detail: emitters.length > 0 ? `event '${eventKey}' emitted in ${emitters.slice(0, 2).join(", ")}` : `event '${eventKey}' has no emitter in the code`
+      });
+    }
     if (passed.length === 0 && failures.length === 0 && carried.length === 0)
       return null;
     return {
