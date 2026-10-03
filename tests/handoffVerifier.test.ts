@@ -185,6 +185,96 @@ describe("handoff shims — metric + test claims", () => {
   });
 });
 
+describe("handoff shims — resources carried from earlier passes", () => {
+  /** Writer stub: flags (key → variations) and metric keys that exist. */
+  const writer = (flags: Record<string, string[]>, metrics: string[], fail = false): LdResourceWriter =>
+    ({
+      projectKey: "app",
+      async getFlagState(key: string) {
+        if (fail) throw new Error("HTTP 503");
+        const values = flags[key];
+        return values
+          ? { exists: true, key, kind: "multivariate", variations: values.map((value) => ({ value })), environments: {} }
+          : { exists: false, key, kind: "multivariate", variations: [], environments: {} };
+      },
+      async metricExists(key: string) {
+        if (fail) throw new Error("HTTP 503");
+        return metrics.includes(key);
+      },
+    }) as unknown as LdResourceWriter;
+
+  it("re-reads the flag and metrics an earlier pass created when this pass didn't claim them", async () => {
+    const verify = buildHandoffVerifier({ sandboxRoot: root, writer: writer({ "enable-x": ["control", "v1"] }, ["m1", "m2"]) });
+    // A no-op rework pass: only tests_last_run of its own; the inventory carries the rest.
+    const r = await verify({
+      configKey: "metrics",
+      tags: { tests_last_run: "pass" },
+      inventory: { flag_key: "enable-x", flag_variation: "v1", metric_keys: "m1,m2" },
+    });
+    assert.equal(r?.ok, true);
+    assert.deepEqual(
+      r?.carried?.map((c) => `${c.ok ? "✓" : "✗"} ${c.name}`),
+      ["✓ flag-exists-in-ld", "✓ variation-exists-in-ld", "✓ metric-exists-in-ld", "✓ metric-exists-in-ld"],
+    );
+  });
+
+  it("does not re-check what this pass claims itself (those are its own checks)", async () => {
+    const verify = buildHandoffVerifier({ sandboxRoot: root, writer: writer({}, ["m1", "m2"]) });
+    const r = await verify({ configKey: "metrics", tags: { metric_keys: "m2" }, inventory: { metric_keys: "m1,m2" } });
+    assert.deepEqual(r?.passed.map((c) => c.detail), ["metric 'm2' exists in project 'app'"]);
+    assert.deepEqual(r?.carried?.map((c) => c.detail), ["metric 'm1' exists in project 'app'"]);
+  });
+
+  it("a carried resource that's gone, or unreadable, is evidence — never a node failure", async () => {
+    const gone = await buildHandoffVerifier({ sandboxRoot: root, writer: writer({}, []) })({
+      configKey: "metrics",
+      tags: {},
+      inventory: { flag_key: "enable-x", metric_keys: "m1" },
+    });
+    assert.equal(gone?.ok, true);
+    assert.deepEqual(gone?.failures, []);
+    assert.ok(gone?.carried?.every((c) => !c.ok));
+
+    const unreadable = await buildHandoffVerifier({ sandboxRoot: root, writer: writer({}, [], true) })({
+      configKey: "metrics",
+      tags: {},
+      inventory: { metric_keys: "m1" },
+    });
+    assert.equal(unreadable?.ok, true);
+    assert.match(unreadable?.carried?.[0]?.detail ?? "", /could not re-read: HTTP 503/);
+  });
+
+  it("re-greps event emitters an earlier pass instrumented; a missing one is evidence, not a failure", async () => {
+    write("src/api.ts", `flags.track('m-error');\n`);
+    const verify = buildHandoffVerifier({ sandboxRoot: root });
+    const r = await verify({
+      configKey: "metrics",
+      tags: { tests_last_run: "pass" },
+      inventory: { metric_event_keys: "m-error,m-gone,sentry-errors" },
+    });
+    assert.equal(r?.ok, true);
+    assert.deepEqual(r?.failures, []);
+    assert.deepEqual(
+      r?.carried?.map((c) => `${c.ok ? "✓" : "✗"} ${c.detail}`),
+      ["✓ event 'm-error' emitted in src/api.ts", "✗ event 'm-gone' has no emitter in the code"],
+      "Sentry integration keys need no emitter and are skipped",
+    );
+  });
+
+  it("an event this pass claims itself is its own check, not carried", async () => {
+    write("src/api.ts", `flags.track('m-error');\n`);
+    const verify = buildHandoffVerifier({ sandboxRoot: root });
+    const r = await verify({ configKey: "metrics", tags: { metric_event_keys: "m-error" }, inventory: { metric_event_keys: "m-error" } });
+    assert.equal(r?.passed.length, 1);
+    assert.equal(r?.carried, undefined);
+  });
+
+  it("nothing carried and nothing claimed → null, as before", async () => {
+    const verify = buildHandoffVerifier({ sandboxRoot: root, writer: writer({}, []) });
+    assert.equal(await verify({ configKey: "research", tags: {}, inventory: {} }), null);
+  });
+});
+
 describe("filesContaining", () => {
   it("skips node_modules/dist/.release-flags and finds nested hits", () => {
     write("a/b/hit.txt", "needle here");

@@ -75151,13 +75151,18 @@ async function walkGraph(graphDef, runner, context, inputs = {}) {
     let verification = null;
     if (verifier && !replaying && result.status !== "failed") {
       try {
-        verification = await verifier({ configKey: key, tags: result.tags });
+        verification = await verifier({ configKey: key, tags: result.tags, inventory: { ...inventory } });
         if (verification) {
-          onEvent?.({ type: "node-verified", verification });
+          if (verification.passed.length + verification.failures.length > 0) {
+            onEvent?.({ type: "node-verified", verification });
+          }
           for (const c6 of verification.passed)
             console.log(`[verify] ${key} \u2713 ${c6.name}: ${c6.detail}`);
           for (const c6 of verification.failures)
             console.error(`[verify] ${key} \u2717 ${c6.name}: ${c6.detail}`);
+          for (const c6 of verification.carried ?? []) {
+            console.log(`[verify] ${key} (carried) ${c6.ok ? "\u2713" : "\u2717"} ${c6.name}: ${c6.detail}`);
+          }
         }
       } catch (e6) {
         console.warn(`[verify] shim errored for '${key}' (non-fatal): ${e6 instanceof Error ? e6.message : e6}`);
@@ -75526,9 +75531,55 @@ function buildHandoffVerifier(opts) {
     } else if (t.tests_last_run === "pass") {
       passed.push({ name: "tests-green-at-handoff", detail: "last run_tests execution passed" });
     }
-    if (passed.length === 0 && failures.length === 0)
+    const carried = [];
+    const inv = run.inventory ?? {};
+    if (opts.writer) {
+      const writer = opts.writer;
+      const carry = async (name, read, okDetail, failDetail) => {
+        try {
+          const ok = await read();
+          carried.push({ name, ok, detail: ok ? okDetail : failDetail });
+        } catch (e6) {
+          carried.push({ name, ok: false, detail: `could not re-read: ${e6 instanceof Error ? e6.message : String(e6)}` });
+        }
+      };
+      const flagKey = inv.flag_key;
+      if (flagKey && !(t.flag_ready === "true" && t.flag_key)) {
+        const variation = inv.flag_variation ?? "";
+        let state2;
+        await carry("flag-exists-in-ld", async () => (state2 = await writer.getFlagState(flagKey)).exists, `'${flagKey}' exists in project '${writer.projectKey}'`, `'${flagKey}' does NOT exist in project '${writer.projectKey}'`);
+        if (state2?.exists && variation) {
+          const s2 = state2;
+          await carry("variation-exists-in-ld", async () => s2.variations.some((v) => v.value === variation), `variation '${variation}' exists on '${flagKey}'`, `variation '${variation}' does NOT exist on '${flagKey}'`);
+        }
+      }
+      const own = new Set((t.metric_keys ?? "").split(",").filter(Boolean));
+      for (const metricKey of (inv.metric_keys ?? "").split(",").filter(Boolean)) {
+        if (own.has(metricKey))
+          continue;
+        await carry("metric-exists-in-ld", () => writer.metricExists(metricKey), `metric '${metricKey}' exists in project '${writer.projectKey}'`, `metric '${metricKey}' does NOT exist in project '${writer.projectKey}'`);
+      }
+    }
+    const ownEvents = new Set((t.metric_event_keys ?? "").split(",").filter(Boolean));
+    for (const eventKey of (inv.metric_event_keys ?? "").split(",").filter(Boolean)) {
+      if (ownEvents.has(eventKey) || SENTRY_INTEGRATION_EVENT_KEYS.has(eventKey))
+        continue;
+      const emitters = filesContaining(opts.sandboxRoot, eventKey);
+      carried.push({
+        name: "metric-event-instrumented",
+        ok: emitters.length > 0,
+        detail: emitters.length > 0 ? `event '${eventKey}' emitted in ${emitters.slice(0, 2).join(", ")}` : `event '${eventKey}' has no emitter in the code`
+      });
+    }
+    if (passed.length === 0 && failures.length === 0 && carried.length === 0)
       return null;
-    return { node: run.configKey, ok: failures.length === 0, passed, failures };
+    return {
+      node: run.configKey,
+      ok: failures.length === 0,
+      passed,
+      failures,
+      ...carried.length > 0 ? { carried } : {}
+    };
   };
 }
 
@@ -80292,13 +80343,20 @@ function samplingRateOf(j6) {
   return raw > 1 ? raw / 100 : raw;
 }
 function formatVerificationEvidence(verification) {
-  if (!verification || verification.passed.length + verification.failures.length === 0)
+  if (!verification)
     return void 0;
-  return [
+  const carried = verification.carried ?? [];
+  if (verification.passed.length + verification.failures.length + carried.length === 0)
+    return void 0;
+  const lines = [
     "DETERMINISTIC CHECKS (re-derived by the pipeline from the LaunchDarkly API and the checkout):",
     ...verification.passed.map((c6) => `\u2713 ${c6.name}: ${c6.detail}`),
     ...verification.failures.map((c6) => `\u2717 ${c6.name}: ${c6.detail}`)
-  ].join("\n");
+  ];
+  if (carried.length > 0) {
+    lines.push("Resources created earlier in this run (by a previous step or pass), re-read in LaunchDarkly now:", ...carried.map((c6) => `${c6.ok ? "\u2713" : "\u2717"} ${c6.name}: ${c6.detail}`));
+  }
+  return lines.join("\n");
 }
 function createJudgeHook(opts) {
   return async ({ configKey, cfg, input, output, tracker, verification }) => {

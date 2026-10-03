@@ -1340,11 +1340,17 @@ export async function walkGraph(
     let verification: HandoffVerification | null = null;
     if (verifier && !replaying && result.status !== "failed") {
       try {
-        verification = await verifier({ configKey: key, tags: result.tags });
+        verification = await verifier({ configKey: key, tags: result.tags, inventory: { ...inventory } });
         if (verification) {
-          onEvent?.({ type: "node-verified", verification });
+          // The event reports the node's OWN claims; carried re-reads are judge evidence only.
+          if (verification.passed.length + verification.failures.length > 0) {
+            onEvent?.({ type: "node-verified", verification });
+          }
           for (const c of verification.passed) console.log(`[verify] ${key} ✓ ${c.name}: ${c.detail}`);
           for (const c of verification.failures) console.error(`[verify] ${key} ✗ ${c.name}: ${c.detail}`);
+          for (const c of verification.carried ?? []) {
+            console.log(`[verify] ${key} (carried) ${c.ok ? "✓" : "✗"} ${c.name}: ${c.detail}`);
+          }
         }
       } catch (e) {
         console.warn(`[verify] shim errored for '${key}' (non-fatal): ${e instanceof Error ? e.message : e}`);

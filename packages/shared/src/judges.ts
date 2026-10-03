@@ -198,12 +198,21 @@ function samplingRateOf(j: Record<string, unknown>): number {
  * the checkout. Undefined when no checks applied to the node.
  */
 export function formatVerificationEvidence(verification: HandoffVerification | undefined): string | undefined {
-  if (!verification || verification.passed.length + verification.failures.length === 0) return undefined;
-  return [
+  if (!verification) return undefined;
+  const carried = verification.carried ?? [];
+  if (verification.passed.length + verification.failures.length + carried.length === 0) return undefined;
+  const lines = [
     "DETERMINISTIC CHECKS (re-derived by the pipeline from the LaunchDarkly API and the checkout):",
     ...verification.passed.map((c) => `✓ ${c.name}: ${c.detail}`),
     ...verification.failures.map((c) => `✗ ${c.name}: ${c.detail}`),
-  ].join("\n");
+  ];
+  if (carried.length > 0) {
+    lines.push(
+      "Resources created earlier in this run (by a previous step or pass), re-read in LaunchDarkly now:",
+      ...carried.map((c) => `${c.ok ? "✓" : "✗"} ${c.name}: ${c.detail}`),
+    );
+  }
+  return lines.join("\n");
 }
 
 export function createJudgeHook(opts: CreateJudgeHookOptions): JudgeHook {
