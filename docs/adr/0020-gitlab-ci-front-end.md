@@ -56,6 +56,12 @@ GitLab differs where it matters:
    provider flag routes to `anthropic` (the bundle runs without `npm ci`, so
    there is no Cursor SDK).
 7. `parseSlug` keeps the full remote path so nested GitLab groups survive.
+8. **No `[skip ci]` on GitLab** (`CodeHost.skipCiMarker`). Job-token pushes
+   never trigger pipelines, so the marker guards nothing there, and on the head
+   commit it skips manual and API-created pipelines too. The manifest commit
+   lands before an approval gate, so the marker would make every resume's "Run
+   pipeline" a skipped pipeline (seen live). GitHub keeps it: there the agents'
+   pushes would otherwise re-trigger the workflow.
 
 ## Consequences
 

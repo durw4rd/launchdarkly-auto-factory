@@ -106,7 +106,7 @@ function createVegaClient(): VegaClient {
  * Flag creation is enabled (real `create_flag` against the app project) when
  * ENABLE_FLAG_CREATION=true and an api- key is present; otherwise read-only.
  */
-function createAgentRunner(provider: string, kg?: AssembledGraph): AgentRunner {
+function createAgentRunner(provider: string, kg: AssembledGraph | undefined, skipCi: boolean): AgentRunner {
   if (provider === "vega") {
     if (kg) console.log("Knowledge graph: composed, but the Vega provider runs tools server-side — enrichment applies to local providers only.");
     return new VegaAgentRunner(createVegaClient());
@@ -134,6 +134,7 @@ function createAgentRunner(provider: string, kg?: AssembledGraph): AgentRunner {
   const localOpts = {
     sandboxRoot,
     codeChangesEnabled,
+    skipCi,
     ...(writer ? { writer } : {}),
     ...(process.env.PR_BRANCH ? { prBranch: process.env.PR_BRANCH } : {}),
     ...(process.env.PR_BASE_REF ? { prBaseRef: process.env.PR_BASE_REF } : {}),
@@ -270,7 +271,8 @@ async function reviewManifestIntent(opts: {
           git(["config", "user.name", "LaunchDarkly AutoFactory"]);
           git(["add", rel]);
           if (git(["diff", "--cached", "--name-only"]).trim()) {
-            git(["commit", "-m", `chore(auto-factory): record approvedBy=${actor} in ${rel}\n\n[skip ci]`]);
+            const marker = opts.host.skipCiMarker ? "\n\n[skip ci]" : "";
+            git(["commit", "-m", `chore(auto-factory): record approvedBy=${actor} in ${rel}${marker}`]);
             const branch = opts.prBranch ?? process.env.PR_BRANCH;
             git(branch ? ["push", "origin", `HEAD:${branch}`] : ["push"]);
             console.log(`Release intent: recorded approvedBy=${actor} in ${rel}.`);
@@ -574,7 +576,7 @@ async function main(): Promise<void> {
     console.log("Knowledge graph: off (auto-factory-knowledge-graph) — agents run un-enriched (baseline).");
   }
 
-  const runner = createAgentRunner(provider, kg);
+  const runner = createAgentRunner(provider, kg, host.skipCiMarker);
 
   // The approval policy: mode (yolo / risk-threshold / always) + risk threshold
   // + gated steps, all from LaunchDarkly flags, COMPILED into pre-execution

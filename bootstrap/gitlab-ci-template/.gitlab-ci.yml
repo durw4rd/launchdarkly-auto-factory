@@ -13,15 +13,16 @@
 # - Label changes don't start pipelines: to pass an approval gate, add the
 #   `af-approve:<step>` label, then run a new pipeline from the MR's Pipelines tab.
 # - The agents push with CI_JOB_TOKEN, and job-token pushes start no pipeline,
-#   so the bot's commits can't loop (they also carry [skip ci]).
+#   so the bot's commits can't loop. They deliberately do NOT carry [skip ci]:
+#   on GitLab that marker on the head commit also skips MANUAL pipelines, which
+#   would block the "Run pipeline" that resumes past an approval gate.
 
 workflow:
   rules:
     # No author-based loop guard: the head is often the bot's own commit (the
     # manifest lands before an approval gate), and "skip bot-authored heads"
     # would skip the human's Run pipeline that resumes past the gate. Loops are
-    # already impossible: job-token pushes start no pipeline, and the agents'
-    # commits carry [skip ci].
+    # already impossible: job-token pushes start no pipeline.
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
 
 autofactory:

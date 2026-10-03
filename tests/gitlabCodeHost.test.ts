@@ -161,6 +161,11 @@ describe("GitLab code host: approvals", () => {
     assert.equal(calls[0]?.url, `${MR}/resource_label_events?per_page=100`);
   });
 
+  it("drops the [skip ci] marker (job-token pushes start no pipeline; the marker would skip manual resumes)", () => {
+    assert.equal(createGitLabHost(target).skipCiMarker, false);
+    assert.equal(resolveCodeHost({}).skipCiMarker, true, "GitHub keeps it");
+  });
+
   it("pauses with exit 78 and says a new pipeline is needed", () => {
     const host = createGitLabHost(target);
     assert.equal(host.pauseExitCode, PAUSE_EXIT_CODE);

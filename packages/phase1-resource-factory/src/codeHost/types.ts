@@ -32,6 +32,14 @@ export interface CodeHost {
    * shows "passed with warnings" instead of green or red.
    */
   readonly pauseExitCode: number;
+  /**
+   * Whether the agents' commits carry `[skip ci]`. GitHub: yes — its push
+   * triggers would otherwise re-run the chain on its own commits. GitLab: no —
+   * job-token pushes never trigger pipelines, and `[skip ci]` on the head commit
+   * also skips MANUAL pipelines, which blocks the "Run pipeline" that resumes past
+   * an approval gate (the manifest commit lands before the gate).
+   */
+  readonly skipCiMarker: boolean;
   /** Post or update this run's single summary comment on the change request. */
   postComment(body: string): Promise<void>;
   postStatus(opts: StatusOptions): Promise<void>;

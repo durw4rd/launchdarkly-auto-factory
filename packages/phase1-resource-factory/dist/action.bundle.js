@@ -77813,9 +77813,11 @@ ${verdicts.join("\n")}` : "")
         this.runGit(["add", rel]);
         const staged = this.runGit(["diff", "--cached", "--name-only"]).trim();
         if (staged) {
-          this.runGit(["commit", "-m", `chore(auto-factory): ${existed ? "update" : "create"} ${rel}
-
-[skip ci]`]);
+          this.runGit([
+            "commit",
+            "-m",
+            `chore(auto-factory): ${existed ? "update" : "create"} ${rel}${this.skipCi ? "\n\n[skip ci]" : ""}`
+          ]);
           const branch = this.prBranch ?? process.env.PR_BRANCH;
           this.runGit(branch ? ["push", "origin", `HEAD:${branch}`] : ["push"]);
           commitNote = "committed and pushed to the PR branch";
@@ -81359,6 +81361,7 @@ function createGitHubHost(target) {
     name: "github",
     changeNoun: "PR",
     pauseExitCode: 0,
+    skipCiMarker: true,
     postComment: (body) => postPrComment(body, { prNumber: target.prNumber, repo: target.repo }),
     postStatus: (opts) => postCheckRun({
       name: opts.name,
@@ -81418,6 +81421,7 @@ function createGitLabHost(target = gitLabTargetFromEnv()) {
     name: "gitlab",
     changeNoun: "MR",
     pauseExitCode: PAUSE_EXIT_CODE,
+    skipCiMarker: false,
     async postComment(body) {
       if (!mr || !token) {
         console.log("(MR note skipped \u2014 missing AUTOFACTORY_GITLAB_TOKEN / project / MR iid)");
@@ -81590,7 +81594,7 @@ function createVegaClient() {
   console.log("VEGA_ENDPOINT/VEGA_TOKEN not set \u2014 using stub transport (no agent execution).");
   return new VegaClient(new StubVegaTransport());
 }
-function createAgentRunner(provider, kg) {
+function createAgentRunner(provider, kg, skipCi) {
   if (provider === "vega") {
     if (kg) console.log("Knowledge graph: composed, but the Vega provider runs tools server-side \u2014 enrichment applies to local providers only.");
     return new VegaAgentRunner(createVegaClient());
@@ -81610,6 +81614,7 @@ function createAgentRunner(provider, kg) {
   const localOpts = {
     sandboxRoot,
     codeChangesEnabled,
+    skipCi,
     ...writer ? { writer } : {},
     ...process.env.PR_BRANCH ? { prBranch: process.env.PR_BRANCH } : {},
     ...process.env.PR_BASE_REF ? { prBaseRef: process.env.PR_BASE_REF } : {},
@@ -81696,9 +81701,8 @@ async function reviewManifestIntent(opts) {
           git2(["config", "user.name", "LaunchDarkly AutoFactory"]);
           git2(["add", rel]);
           if (git2(["diff", "--cached", "--name-only"]).trim()) {
-            git2(["commit", "-m", `chore(auto-factory): record approvedBy=${actor} in ${rel}
-
-[skip ci]`]);
+            const marker = opts.host.skipCiMarker ? "\n\n[skip ci]" : "";
+            git2(["commit", "-m", `chore(auto-factory): record approvedBy=${actor} in ${rel}${marker}`]);
             const branch = opts.prBranch ?? process.env.PR_BRANCH;
             git2(branch ? ["push", "origin", `HEAD:${branch}`] : ["push"]);
             console.log(`Release intent: recorded approvedBy=${actor} in ${rel}.`);
@@ -81902,7 +81906,7 @@ async function main() {
   } else {
     console.log("Knowledge graph: off (auto-factory-knowledge-graph) \u2014 agents run un-enriched (baseline).");
   }
-  const runner = createAgentRunner(provider, kg);
+  const runner = createAgentRunner(provider, kg, host.skipCiMarker);
   const policy = await resolveApprovalPolicy(ldClient, ldContext);
   let approvedSteps = /* @__PURE__ */ new Set();
   if (policy.mode !== "yolo") {

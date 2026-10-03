@@ -358,6 +358,26 @@ describe("SandboxToolExecutor — commit_and_push gitMode", () => {
     git(["commit", "-q", "-m", "initial"]);
   }
 
+  it("push mode: the [skip ci] marker follows skipCi on agent AND manifest commits", async () => {
+    for (const skipCi of [true, false]) {
+      rmSync(join(root, ".git"), { recursive: true, force: true });
+      initRepo();
+      const origin = mkdtempSync(join(tmpdir(), "sandbox-origin-"));
+      execFileSync("git", ["init", "-q", "--bare", origin]);
+      git(["remote", "add", "origin", origin]);
+      const exec = new SandboxToolExecutor(root, undefined, true, "feature", undefined, "push", true, false, skipCi);
+      await exec.execute("write_manifest", { path: ".release-flags/pr-9.json", manifest: { flagKey: "enable-x" } });
+      await exec.execute("write_file", { path: "feature.txt", content: `skipCi=${skipCi}\n` });
+      await exec.execute("commit_and_push", { message: "feat: wire flag" });
+      const messages = git(["log", "--format=%B%x00", "-2"]).split("\0").map((m) => m.trim()).filter(Boolean);
+      assert.equal(messages.length, 2);
+      for (const m of messages) {
+        assert.equal(/\[skip ci\]/.test(m), skipCi, `skipCi=${skipCi}: ${JSON.stringify(m)}`);
+      }
+      rmSync(origin, { recursive: true, force: true });
+    }
+  });
+
   it("workingTree mode reports changed files without committing them", async () => {
     initRepo();
     const exec = new SandboxToolExecutor(root, undefined, true, undefined, undefined, "workingTree");

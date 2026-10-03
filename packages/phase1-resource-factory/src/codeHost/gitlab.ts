@@ -89,6 +89,7 @@ export function createGitLabHost(target: GitLabTarget = gitLabTargetFromEnv()): 
     name: "gitlab",
     changeNoun: "MR",
     pauseExitCode: PAUSE_EXIT_CODE,
+    skipCiMarker: false,
 
     async postComment(body) {
       if (!mr || !token) {

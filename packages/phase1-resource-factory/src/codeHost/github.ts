@@ -10,6 +10,7 @@ export function createGitHubHost(target: { repo?: string; prNumber?: string }): 
     name: "github",
     changeNoun: "PR",
     pauseExitCode: 0,
+    skipCiMarker: true,
     postComment: (body) => postPrComment(body, { prNumber: target.prNumber, repo: target.repo }),
     postStatus: (opts) =>
       postCheckRun({
